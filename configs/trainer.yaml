@@ -1,0 +1,17 @@
+model:
+  name: "llama-2-13b"  # base reference; RL policy stub uses MLPPolicy
+  obs_dim: 128
+  action_dim: 32
+
+training:
+  buffer_capacity: 100000
+  min_buffer: 5000
+  batch_size: 256
+  num_epochs: 1
+  lr: 3e-4
+  weight_decay: 0.01
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_eps: 0.2
+  entropy_coef: 0.01
+  checkpoint_dir: "models/checkpoints"

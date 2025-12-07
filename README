@@ -14,6 +14,7 @@ This repository contains scripts to finetune modern open models (default: LLaMA 
   - `node/` (worker client)
   - `utils/` (config helpers)
 - `deployment/` — API server (Flask) with `/generate`, `/health`, `/metrics` (optional auth via `API_TOKEN` env) and Dockerfile.
+- `trainer/`, `policy_service/`, `actors/` — distributed training scaffold (RL trainer loop, policy service stub, actor client/logger).
 - `examples/` — educational transformer implementation.
 - `openweb/` — Open WebUI + Ollama compose.
 - `results/`, `models/`, `logs/` — training artifacts (gitignored).

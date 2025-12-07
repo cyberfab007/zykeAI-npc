@@ -1,0 +1,33 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["block_id", "policy_version", "env_id", "npc_type", "steps"],
+  "properties": {
+    "block_id": { "type": "string" },
+    "policy_version": { "type": "integer" },
+    "env_id": { "type": "string" },
+    "npc_type": { "type": "string" },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["obs", "action", "reward", "done"],
+        "properties": {
+          "obs": {},
+          "action": {},
+          "reward": { "type": "number" },
+          "done": { "type": "boolean" },
+          "log_probs": {},
+          "value_estimates": {}
+        }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "timestamp_start": {},
+        "timestamp_end": {}
+      }
+    }
+  }
+}

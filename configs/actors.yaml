@@ -1,0 +1,5 @@
+trainer_url: "http://localhost:5001"
+policy_service_url: "http://localhost:8000"
+api_token: ""
+block_size: 256
+env_id: "shard-01"

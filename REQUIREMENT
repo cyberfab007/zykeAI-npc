@@ -1,0 +1,94 @@
+Project: Distributed NPC Training for the Metaverse
+
+Goal  
+Train and continuously improve NPC control models by having NPCs play in the metaverse across many machines. Actors (game servers/clients) produce experience blocks; a central trainer integrates them into a single main model.
+
+## High-Level Architecture
+
+### Components
+- **Central Trainer (Learner)**
+  - GPU box; owns the main model (base: frozen LLaMA; trainable: LoRA adapters and/or RL policy net).
+  - Maintains `policy_version`, replay buffer; performs updates and writes checkpoints.
+- **Policy / Inference Service**
+  - Exposes current policy; API: observations → actions (optional logits/values).
+  - Separate process or part of trainer.
+- **Game Workers (Actors)**
+  - Unity/metaverse servers or clients.
+  - Run NPCs with current policy, log experience, send blocks to trainer, refresh weights.
+
+### Suggested Project Structure
+- `trainer/`: `trainer_loop.py` (PPO/A2C/etc.), `replay_buffer.py`, `models.py` (RL + optional LLaMA+LoRA), `checkpointing.py`.
+- `policy_service/`: `server.py` (gRPC/HTTP/WS get_action), `weights_manager.py`.
+- `actors/`: `npc_controller_unity.cs`, `experience_logger.py`, `policy_client.py`.
+- `schemas/`: `experience_block.json`, `delta_block.json`.
+- `configs/`: `trainer.yaml`, `policy_service.yaml`, `actors.yaml`.
+
+## Experience Block
+Structure:
+```
+{
+  "block_id": "string",
+  "policy_version": 17,
+  "env_id": "shard-01",
+  "npc_type": "pirate_trader",
+  "steps": [
+    { "obs": [...], "action": 4, "reward": 0.1, "done": false }
+  ],
+  "meta": { "timestamp_start": "...", "timestamp_end": "..." }
+}
+```
+Notes:
+- `policy_version` = version used to generate all steps.
+- `obs`: numeric vector (preferred) or token IDs/serialized state (LLM).
+- Optional: `log_probs`, `value_estimates`, per-step info dict (hit/miss, quest status, etc.).
+
+## Game Worker (Actor) Logic
+- **Init:** query policy service (`current_policy_version`, `weights_hash` optional); load weights locally if doing local inference.
+- **Per tick (per NPC):** collect `obs_t`; call `get_action(npc_type, obs_t)`; apply action; get reward/done; append `(obs, action, reward, done, policy_version, npc_type, env_id)` to buffer.
+- **Block emission:** when buffer ≥ BLOCK_SIZE, episode ends, or timeout; package `experience_block`; send to `/api/experience_block`; clear buffer.
+- **Policy refresh:** periodically check `latest_policy_version`; if newer, download weights, hot-swap, update local version.
+
+## Central Trainer
+- **Ingestion:** `/api/experience_block`; validate; check staleness (`policy_version` vs current); store in replay buffer (memory + optional disk).
+- **Training (e.g., PPO):**
+  - Wait for `MIN_BUFFER_SIZE`.
+  - Sample mini-batches; compute advantages (GAE), policy loss, value loss, entropy bonus; backprop on policy net (LoRA layers or RL net); optimizer step.
+  - Every `CHECKPOINT_INTERVAL`: save `model_v{policy_version+1}.pt`, increment `policy_version`, notify policy service.
+- **Publishing:** maintain `current_policy_version`; mapping `version -> checkpoint_path`; provide `/api/current_policy_version` and `/api/get_checkpoint?version=X`.
+
+## Policy Service
+- Loads latest weights; provides low-latency `get_action` and `current_policy_version`.
+- Deploy near trainer (GPU). Poll for new versions; download; hot-reload with brief lock.
+
+## Model Options
+- **Option A: Small RL policy net (MVP)** — numeric obs → action distribution; PPO-trained.
+- **Option B: LLaMA + LoRA policy** — serialized state prompt → action tokens; RL or supervised + RLHF; heavier/slower.
+- **Option C: Hybrid** — LLaMA+LoRA for high-level intent; small RL for low-level control (LLM outputs discrete intent; RL executes).
+
+## Versioning Rules
+- `policy_version` monotonically increasing (trainer-owned).
+- Experience blocks must include the policy_version used to generate them.
+- Trainer may downweight stale data; actors never mix versions inside a block.
+
+## Optional: Weight-Delta Blocks (future)
+Structure:
+```
+{
+  "task_id": "string",
+  "base_policy_version": 17,
+  "num_samples": 2048,
+  "delta": "<serialized LoRA parameter diff>",
+  "metrics": { "train_loss": 1.23 }
+}
+```
+Handling: validate base version; aggregate deltas (e.g., weighted by `num_samples`); apply to current weights; emit new `policy_version`. Advanced; do after experience-based RL is stable.
+
+## Rewards and Objectives
+- Define environment-specific rewards aligned to desired behavior.
+  - Trading: profit + completion bonuses − rule-breaking penalties.
+  - Pirate: loot + survival − protected-target penalties.
+  - Quest/Social: quests completed + reputation gains + successful negotiations.
+- Rewards should be dense enough and aligned (avoid exploits).
+
+## Integration into Metaverse Runtime
+- **NPC Controller (Unity / game code):** build observation structs for each NPC; call policy service for actions.

@@ -1,0 +1,17 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["task_id", "base_policy_version", "num_samples", "delta"],
+  "properties": {
+    "task_id": { "type": "string" },
+    "base_policy_version": { "type": "integer" },
+    "num_samples": { "type": "integer" },
+    "delta": { "type": "string" },
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "train_loss": { "type": "number" }
+      }
+    }
+  }
+}
