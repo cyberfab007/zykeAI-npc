@@ -1,7 +1,8 @@
 import argparse
+import json
 import math
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 import torch
 from datasets import load_dataset
@@ -11,6 +12,12 @@ from transformers import (
     DataCollatorForLanguageModeling,
     Trainer,
     TrainingArguments,
+)
+
+from src.inference.generator import (
+    ALLOWED_ACTIONS,
+    ALLOWED_EMOTIONS,
+    generate_npc_response,
 )
 
 
@@ -67,6 +74,29 @@ def parse_args():
         help="Number of PIQA validation examples to score.",
     )
     parser.add_argument(
+        "--hellaswag-samples",
+        type=int,
+        default=200,
+        help="Number of HellaSwag validation examples to score.",
+    )
+    parser.add_argument(
+        "--winogrande-samples",
+        type=int,
+        default=200,
+        help="Number of WinoGrande validation examples to score.",
+    )
+    parser.add_argument(
+        "--arc-samples",
+        type=int,
+        default=200,
+        help="Number of ARC examples to score.",
+    )
+    parser.add_argument(
+        "--arc-split",
+        default="ARC-Challenge",
+        help="ARC split: ARC-Challenge or ARC-Easy.",
+    )
+    parser.add_argument(
         "--c4-split",
         default="validation[:0.1%]",
         help="C4 split for perplexity (use a small slice).",
@@ -75,6 +105,22 @@ def parse_args():
         "--lambada-split",
         default="validation",
         help="LAMBADA split to use for perplexity.",
+    )
+    parser.add_argument(
+        "--npc-jsonl",
+        default="data/processed/npc_val.jsonl",
+        help="NPC schema dataset (JSONL) for adherence checks.",
+    )
+    parser.add_argument(
+        "--npc-samples",
+        type=int,
+        default=50,
+        help="Number of NPC schema samples to generate for adherence metrics.",
+    )
+    parser.add_argument(
+        "--npc-safe-mode",
+        action="store_true",
+        help="Enforce safe_mode during NPC adherence eval.",
     )
     return parser.parse_args()
 
@@ -169,23 +215,51 @@ def compute_piqa_accuracy(model, tokenizer, device, samples: int) -> float:
     return correct / total if total else float("nan")
 
 
-def run_regression_prompts(model, tokenizer, device):
-    model.eval()
-    for item in REGRESSION_PROMPTS:
-        inputs = tokenizer(
-            item["prompt"], return_tensors="pt", truncation=True, max_length=256
-        ).to(device)
-        with torch.no_grad():
-            output = model.generate(
-                **inputs,
-                max_new_tokens=item["max_new_tokens"],
-                do_sample=True,
-                temperature=0.8,
-                top_p=0.9,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-        text = tokenizer.decode(output[0], skip_special_tokens=True)
-        print(f"[{item['name']}] {text}\n")
+def compute_hellaswag_accuracy(model, tokenizer, device, samples: int) -> float:
+    ds = load_dataset("hellaswag", split=f"validation[:{samples}]")
+    correct = 0
+    total = 0
+    for sample in ds:
+        ctx = sample["ctx_a"] + " " + sample["ctx_b"]
+        endings = sample["endings"]
+        scores = [score_option_logprob(model, tokenizer, ctx, e, device) for e in endings]
+        pred = int(torch.tensor(scores).argmax().item())
+        if pred == sample["label"]:
+            correct += 1
+        total += 1
+    return correct / total if total else float("nan")
+
+
+def compute_winogrande_accuracy(model, tokenizer, device, samples: int) -> float:
+    ds = load_dataset("winogrande", "winogrande_xl", split=f"validation[:{samples}]")
+    correct = 0
+    total = 0
+    for sample in ds:
+        prompt = sample["sentence"].replace("_", "")
+        opts = [sample["option1"], sample["option2"]]
+        scores = [score_option_logprob(model, tokenizer, prompt, o, device) for o in opts]
+        pred = 0 if scores[0] >= scores[1] else 1
+        label = 0 if sample["answer"] == "1" else 1
+        if pred == label:
+            correct += 1
+        total += 1
+    return correct / total if total else float("nan")
+
+
+def compute_arc_accuracy(model, tokenizer, device, samples: int, split: str) -> float:
+    ds = load_dataset("ai2_arc", split=f"{split.lower()}[:{samples}]")
+    correct = 0
+    total = 0
+    for sample in ds:
+        question = sample["question"]
+        choices = sample["choices"]["text"]
+        scores = [score_option_logprob(model, tokenizer, question, c, device) for c in choices]
+        pred_idx = int(torch.tensor(scores).argmax().item())
+        pred_label = sample["choices"]["label"][pred_idx]
+        if pred_label == sample["answerKey"]:
+            correct += 1
+        total += 1
+    return correct / total if total else float("nan")
 
 
 def main():
@@ -249,6 +323,57 @@ def main():
             print(f"PIQA accuracy (first {args.piqa_samples} val): {acc:.3f}")
         except Exception as exc:  # pragma: no cover - diagnostic
             print(f"PIQA evaluation failed: {exc}")
+    if "hellaswag" in evals:
+        try:
+            acc = compute_hellaswag_accuracy(model, tokenizer, device, args.hellaswag_samples)
+            print(f"HellaSwag accuracy (first {args.hellaswag_samples} val): {acc:.3f}")
+        except Exception as exc:  # pragma: no cover - diagnostic
+            print(f"HellaSwag evaluation failed: {exc}")
+    if "winogrande" in evals:
+        try:
+            acc = compute_winogrande_accuracy(model, tokenizer, device, args.winogrande_samples)
+            print(f"WinoGrande accuracy (first {args.winogrande_samples} val): {acc:.3f}")
+        except Exception as exc:  # pragma: no cover - diagnostic
+            print(f"WinoGrande evaluation failed: {exc}")
+    if "arc" in evals:
+        try:
+            acc = compute_arc_accuracy(model, tokenizer, device, args.arc_samples, args.arc_split)
+            print(f"ARC accuracy ({args.arc_split}, first {args.arc_samples}): {acc:.3f}")
+        except Exception as exc:  # pragma: no cover - diagnostic
+            print(f"ARC evaluation failed: {exc}")
+
+    # NPC adherence check
+    npc_path = Path(args.npc_jsonl)
+    if npc_path.exists():
+        try:
+            with npc_path.open("r", encoding="utf-8") as f:
+                lines = [json.loads(line) for line in f if line.strip()]
+            samples = lines[: args.npc_samples]
+            valid = 0
+            total = 0
+            for sample in samples:
+                result = generate_npc_response(
+                    base_model=args.base_model,
+                    tokenizer_path=args.tokenizer_path,
+                    adapter_path=args.adapter_path,
+                    persona=sample.get("persona", ""),
+                    context=sample.get("context", ""),
+                    state=sample.get("state", ""),
+                    player_input=sample.get("player", ""),
+                    safe_mode=args.npc_safe_mode,
+                )
+                total += 1
+                if (
+                    isinstance(result, dict)
+                    and result.get("say")
+                    and result.get("action") in ALLOWED_ACTIONS
+                    and result.get("emotion") in ALLOWED_EMOTIONS
+                ):
+                    valid += 1
+            if total:
+                print(f"NPC schema adherence (valid JSON/enums): {valid/total:.3f} ({valid}/{total})")
+        except Exception as exc:
+            print(f"NPC adherence evaluation failed: {exc}")
 
     print("Regression prompt generations:")
     run_regression_prompts(model, tokenizer, device)
