@@ -10,6 +10,7 @@ from transformers import (
     Trainer,
     TrainingArguments,
     DataCollatorForLanguageModeling,
+    EarlyStoppingCallback,
 )
 
 try:
@@ -92,6 +93,64 @@ def parse_args():
         action="store_true",
         help="Enable LoRA adapter training instead of full fine-tuning.",
     )
+    parser.add_argument("--learning-rate", type=float, default=2e-5, help="Learning rate.")
+    parser.add_argument(
+        "--num-epochs", type=int, default=3, help="Number of training epochs."
+    )
+    parser.add_argument(
+        "--per-device-train-batch-size",
+        type=int,
+        default=2,
+        help="Per-device train batch size.",
+    )
+    parser.add_argument(
+        "--per-device-eval-batch-size",
+        type=int,
+        default=2,
+        help="Per-device eval batch size.",
+    )
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=1,
+        help="Gradient accumulation steps.",
+    )
+    parser.add_argument(
+        "--warmup-steps", type=int, default=100, help="Number of warmup steps."
+    )
+    parser.add_argument(
+        "--lr-scheduler-type",
+        default="linear",
+        help="LR scheduler type (linear, cosine, cosine_with_restarts, etc.).",
+    )
+    parser.add_argument(
+        "--weight-decay", type=float, default=0.01, help="Weight decay."
+    )
+    parser.add_argument(
+        "--adam-beta1", type=float, default=0.9, help="Adam beta1."
+    )
+    parser.add_argument(
+        "--adam-beta2", type=float, default=0.98, help="Adam beta2."
+    )
+    parser.add_argument(
+        "--max-grad-norm", type=float, default=1.0, help="Max gradient norm for clipping."
+    )
+    parser.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=0,
+        help="Early stopping patience in eval steps (0 to disable).",
+    )
+    parser.add_argument(
+        "--bf16",
+        action="store_true",
+        help="Force bfloat16 mixed precision when supported (recommended for Ampere+).",
+    )
+    parser.add_argument(
+        "--enable-flash-attn",
+        action="store_true",
+        help="Enable PyTorch flash/mem-efficient attention kernels (requires compatible GPU/torch).",
+    )
     parser.add_argument("--lora-r", type=int, default=8, help="LoRA rank.")
     parser.add_argument(
         "--lora-alpha", type=int, default=16, help="LoRA alpha (scaling)."
@@ -119,8 +178,23 @@ def train():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    torch_dtype = None
+    if torch.cuda.is_available():
+        if args.bf16 and torch.cuda.is_bf16_supported():
+            torch_dtype = torch.bfloat16
+        else:
+            torch_dtype = torch.float16
+
+    if args.enable_flash_attn and torch.cuda.is_available():
+        try:
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_math_sdp(False)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+        except Exception:
+            pass
+
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, trust_remote_code=True, torch_dtype=torch.float16 if torch.cuda.is_available() else None
+        model_name, trust_remote_code=True, torch_dtype=torch_dtype
     )
     model.resize_token_embeddings(len(tokenizer))
     model.config.pad_token_id = tokenizer.pad_token_id
@@ -172,17 +246,31 @@ def train():
 
     training_args = TrainingArguments(
         output_dir=str(output_dir),
-        num_train_epochs=3,
-        per_device_train_batch_size=2,
-        per_device_eval_batch_size=2,
-        evaluation_strategy="epoch",
-        save_steps=10_000,
-        save_total_limit=2,
-        logging_steps=500,
-        fp16=torch.cuda.is_available(),
+        num_train_epochs=args.num_epochs,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        per_device_eval_batch_size=args.per_device_eval_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        evaluation_strategy="steps",
+        eval_steps=1000,
+        save_steps=1000,
+        save_total_limit=3,
+        logging_steps=200,
+        fp16=torch.cuda.is_available() and not (args.bf16 and torch.cuda.is_bf16_supported()),
+        bf16=torch.cuda.is_available() and args.bf16 and torch.cuda.is_bf16_supported(),
         report_to=report_to,
         logging_dir=str(log_dir),
+        learning_rate=args.learning_rate,
+        warmup_steps=args.warmup_steps,
+        lr_scheduler_type=args.lr_scheduler_type,
+        weight_decay=args.weight_decay,
+        adam_beta1=args.adam_beta1,
+        adam_beta2=args.adam_beta2,
+        max_grad_norm=args.max_grad_norm,
     )
+
+    callbacks = []
+    if args.early_stop_patience > 0:
+        callbacks.append(EarlyStoppingCallback(early_stopping_patience=args.early_stop_patience))
 
     trainer = Trainer(
         model=model,
@@ -190,6 +278,7 @@ def train():
         train_dataset=tokenized_datasets["train"],
         eval_dataset=tokenized_datasets["test"],
         data_collator=data_collator,
+        callbacks=callbacks,
     )
 
     resume_from = latest_checkpoint(output_dir) if args.resume_latest else None
