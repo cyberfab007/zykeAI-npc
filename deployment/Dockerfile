@@ -1,19 +1,24 @@
-FROM python:3.8-slim
+FROM python:3.10-slim
 
-# Set the working directory
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PORT=5000
+
 WORKDIR /app
 
-# Copy the requirements file
-COPY requirements.txt .
+# Copy root requirements to reuse full dependency set
+COPY requirements.txt /app/requirements.txt
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir -r /app/requirements.txt
 
-# Install dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy deployment app
+COPY deployment /app/deployment
 
-# Copy the rest of the application code
-COPY . .
-
-# Expose the port the app runs on
 EXPOSE 5000
 
-# Command to run the application
-CMD ["python", "app.py"]
+# Healthcheck hits /health
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD curl -fsSL http://127.0.0.1:${PORT}/health || exit 1
+
+# Use gunicorn with threaded workers
+CMD ["gunicorn", "-b", "0.0.0.0:5000", "-k", "gthread", "--threads", "4", "--timeout", "60", "deployment.app:app"]

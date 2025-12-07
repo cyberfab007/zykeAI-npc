@@ -17,6 +17,7 @@ from flask import Flask, jsonify, request
 
 from trainer.checkpointing import save_checkpoint
 from trainer.models import MLPPolicy, make_optimizer
+from trainer.update_validation import UpdateRejected, trimmed_mean, validate_update
 from trainer.weights import load_latest_checkpoint
 
 NUM_TASKS_PER_ROUND = int(os.getenv("NUM_TASKS_PER_ROUND", "3"))
@@ -26,6 +27,10 @@ MAX_STALENESS = int(os.getenv("MAX_STALENESS", "1"))
 CHECKPOINT_DIR = os.getenv("CHECKPOINT_DIR", "models/checkpoints")
 DELTA_NORM_MAX = float(os.getenv("DELTA_NORM_MAX", "1e9"))
 TICK_INTERVAL_SEC = float(os.getenv("TICK_INTERVAL_SEC", "1.0"))
+MIN_DELTA_NORM = float(os.getenv("MIN_DELTA_NORM", "1e-8"))
+TRIM_FRAC = float(os.getenv("TRIM_FRAC", "0.1"))
+REQUIRE_BLOCK_HASH = os.getenv("REQUIRE_BLOCK_HASH", "false").lower() == "true"
+BLOCK_HASH_MAP = os.getenv("BLOCK_HASH_MAP")  # path to block_id->hash mapping (JSON)
 
 app = Flask(__name__)
 
@@ -113,19 +118,17 @@ class VersionedAggregator:
         updates = self.pending_updates.get(version, [])
         if not updates:
             return
-        agg_delta = {k: torch.zeros_like(v) for k, v in self.global_state.items()}
-        total_samples = sum(u["num_samples"] for u in updates)
-        if total_samples == 0:
-            self.pending_updates[version] = []
-            self.round_start_time[version] = time.time()
-            return
+        # Robust aggregation: trimmed mean with norm clipping
+        clipped_updates = []
         for u in updates:
-            weight = float(u["num_samples"]) / float(total_samples)
-            for k, delta_tensor in u["delta_state"].items():
-                if k in agg_delta:
-                    agg_delta[k] += weight * delta_tensor.to(agg_delta[k].dtype)
+            clipped = {}
+            for k, t in u["delta_state"].items():
+                clipped[k] = torch.clamp(t, min=-1e3, max=1e3)
+            clipped_updates.append(clipped)
+        agg_delta = trimmed_mean(clipped_updates, trim_frac=TRIM_FRAC)
         for k in self.global_state.keys():
-            self.global_state[k] = self.global_state[k] + agg_delta[k]
+            if k in agg_delta:
+                self.global_state[k] = self.global_state[k] + agg_delta[k].to(self.global_state[k].dtype)
         self.current_version = version + 1
         del self.pending_updates[version]
         del self.round_start_time[version]
@@ -141,10 +144,12 @@ model: torch.nn.Module
 optimizer: torch.optim.Optimizer
 aggregator: VersionedAggregator
 _ticker_thread: threading.Thread
+block_hashes: Dict[str, str] = {}
+task_history: List[Dict] = []
 
 
 def init_trainer():
-    global model, optimizer, aggregator, _ticker_thread
+    global model, optimizer, aggregator, _ticker_thread, block_hashes, task_history
     Path(CHECKPOINT_DIR).mkdir(parents=True, exist_ok=True)
     model = MLPPolicy(obs_dim=128, action_dim=32)
     optimizer = make_optimizer(model)
@@ -153,6 +158,16 @@ def init_trainer():
     aggregator = VersionedAggregator(get_trainable_state(model), current_version)
     if loaded_version is None:
         save_checkpoint(model, optimizer, current_version, CHECKPOINT_DIR)
+    # Load block hash map if provided
+    if BLOCK_HASH_MAP:
+        try:
+            import json
+
+            with open(BLOCK_HASH_MAP, "r", encoding="utf-8") as f:
+                block_hashes = json.load(f)
+        except Exception:
+            block_hashes = {}
+    task_history = []
     _ticker_thread = threading.Thread(target=_tick_loop, daemon=True)
     _ticker_thread.start()
 
@@ -204,6 +219,95 @@ def get_lora_weights():
     return jsonify({"version": aggregator.current_version, "lora_state_b64": b64})
 
 
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"}), 200
+
+
+@app.route("/worker_status", methods=["GET"])
+def worker_status():
+    with state_lock:
+        state = "training" if aggregator.pending_updates.get(aggregator.current_version) else "idle"
+        blocks = []
+        for entry in task_history[-10:]:
+            blocks.append(
+                {
+                    "block_id": entry.get("block_id", ""),
+                    "status": entry.get("status", ""),
+                    "loss": entry.get("loss", ""),
+                    "updated_at": entry.get("updated_at", ""),
+                }
+            )
+        status = {
+            "node_id": os.getenv("NODE_ID", "local"),
+            "state": state,
+            "base_model_version": aggregator.current_version if aggregator else None,
+            "adapter_name": None,
+            "quantization": None,
+            "use_flash_attn": False,
+            "compile_model": False,
+            "blocks_processed": len(task_history),
+            "blocks": blocks,
+            "device": "cuda" if torch.cuda.is_available() else "cpu",
+        }
+    return jsonify(status), 200
+
+
+@app.route("/run_starter_test", methods=["POST"])
+def run_starter_test():
+    """
+    Lightweight starter-block train/eval:
+    - Reads data/starter_blocks/*.jsonl
+    - Runs a tiny dummy MLP step on token counts (fast smoke)
+    - Reports avg loss/time
+    """
+    root = Path("data/starter_blocks")
+    if not root.exists():
+        return jsonify({"ok": False, "message": "starter_blocks path not found"}), 400
+
+    files = list(root.glob("*.jsonl"))
+    if not files:
+        return jsonify({"ok": False, "message": "no starter_block files found"}), 400
+
+    start = time.time()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = MLPPolicy(obs_dim=32, action_dim=8).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    losses = []
+    max_steps = 50
+    step = 0
+    for f in files:
+        with f.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                if step >= max_steps:
+                    break
+                try:
+                    import json
+
+                    obj = json.loads(line)
+                    text = (obj.get("input", "") + " " + obj.get("target", "")).strip()
+                except Exception:
+                    text = ""
+                # simple feature: length mod some number
+                feat = len(text) % 100
+                obs = torch.tensor([[feat] + [0] * 31], dtype=torch.float32, device=device)
+                logits, _ = model(obs)
+                target = torch.tensor([feat % 8], dtype=torch.long, device=device)
+                loss = torch.nn.functional.cross_entropy(logits, target)
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                losses.append(loss.item())
+                step += 1
+                if step >= max_steps:
+                    break
+
+    elapsed = time.time() - start
+    avg_loss = sum(losses) / len(losses) if losses else float("nan")
+    return jsonify({"ok": True, "message": f"starter_test steps={len(losses)}, avg_loss={avg_loss:.4f}, time={elapsed:.2f}s"}), 200
+
+
 def metrics_valid(metrics: Dict) -> bool:
     if not metrics:
         return True
@@ -231,10 +335,32 @@ def submit_update():
     if not metrics_valid(metrics):
         return jsonify({"accepted": False, "reason": "metrics_invalid"}), 400
 
+    if REQUIRE_BLOCK_HASH:
+        if "block_id" not in payload or "block_hash" not in payload:
+            return jsonify({"accepted": False, "reason": "block_hash_required"}), 400
+        block_id = payload["block_id"]
+        submitted_hash = payload["block_hash"]
+        canonical_hash = block_hashes.get(block_id)
+        if canonical_hash is None:
+            return jsonify({"accepted": False, "reason": "unknown_block_id"}), 400
+    else:
+        block_id = None
+        submitted_hash = None
+        canonical_hash = None
+
     delta_state = decode_delta(payload["lora_delta"])
-    delta_norm = delta_l2_norm(delta_state)
-    if math.isnan(delta_norm) or math.isinf(delta_norm) or delta_norm > DELTA_NORM_MAX:
-        return jsonify({"accepted": False, "reason": "delta_norm_invalid"}), 400
+    try:
+        validate_update(
+            delta_state=delta_state,
+            metrics=metrics,
+            block_hash_submitted=payload.get("block_hash"),
+            block_hash_canonical=canonical_hash,
+            min_norm=MIN_DELTA_NORM,
+            max_norm=DELTA_NORM_MAX,
+            ref_grad=None,  # optional reference gradient
+        )
+    except UpdateRejected as exc:
+        return jsonify({"accepted": False, "reason": str(exc)}), 400
 
     with state_lock:
         global_state = aggregator.get_current_state()
@@ -243,6 +369,15 @@ def submit_update():
         accepted, aggregated = aggregator.submit_update(base_version, num_samples, delta_state, metrics)
         if not accepted:
             return jsonify({"accepted": False, "reason": "stale_version"}), 400
+        # Record task in history
+        task_history.append(
+            {
+                "block_id": payload.get("block_id", ""),
+                "status": "submitted",
+                "loss": metrics.get("train_loss_mean", None) if isinstance(metrics, dict) else None,
+                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        )
         # Save checkpoint if we aggregated this round
         if aggregated:
             apply_agg_state_to_model()

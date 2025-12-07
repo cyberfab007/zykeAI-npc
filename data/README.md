@@ -5,6 +5,7 @@
 - `lib/wikipedia-downloader` contains a helper to fetch the 2020 Wikipedia dump and convert it to JSON shards.
 - `make_experience_blocks.py` turns local corpora (.txt/.jsonl) into training blocks that match `schemas/experience_block.json`, suitable for the distributed trainer.
 - `starter_blocks/` holds tiny JSONL starter sets for smoke tests and warmup (general text, dialogue, code, lore, instructions). Each line: `{"input": "...", "target": "...", "tags": [...]}`.
+- `adapters/manifest.json` lists available adapters (metadata + paths) for runtime selection and publishing.
 
 Example:
 ```

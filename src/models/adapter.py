@@ -8,6 +8,8 @@ from transformers import (
     BitsAndBytesConfig,
 )
 
+from src.models.adapter_manifest import select_adapter
+
 
 def _quant_config(quantization: Optional[str]) -> Optional[BitsAndBytesConfig]:
     if quantization is None:
@@ -25,6 +27,8 @@ def load_model_with_adapter(
     base_model: str,
     tokenizer_path: str,
     adapter_path: Optional[str] = None,
+    adapter_name: Optional[str] = None,
+    manifest_path: str = "data/adapters/manifest.json",
     quantization: Optional[str] = None,
     use_flash_attn: bool = False,
     compile_model: bool = False,
@@ -33,6 +37,8 @@ def load_model_with_adapter(
     Load a GPT-2 model and tokenizer, optionally applying a PEFT adapter and quantization.
     Results are cached by (base_model, adapter_path, quantization, tokenizer_path, use_flash_attn, compile_model).
     """
+    if adapter_name and not adapter_path:
+        adapter_path, _entry = select_adapter(adapter_name, manifest_path)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token

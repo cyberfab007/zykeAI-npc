@@ -1,328 +1,725 @@
-import argparse
-import os
-from pathlib import Path
+#!/usr/bin/env python3
+"""
+Local Command Station GUI to manage a worker node and block/cluster state:
+- Start/stop the local worker process
+- View node/model status from /worker_status
+- View and manage the global training block queue
+- View and manage cluster nodes (with state/trust color-coding)
+- Run starter-block smoke test via /run_starter_test
+- Build experience blocks from prepared data
+- Send quick test prompts to the live inference API
 
-import torch
-from datasets import load_dataset
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    Trainer,
-    TrainingArguments,
-    DataCollatorForLanguageModeling,
-    EarlyStoppingCallback,
-)
+Adjust TRAINER_URL, INFERENCE_URL, WORKER_CMD, and expected API schemas to your environment.
+"""
+import queue
+import subprocess
+import threading
+import time
+import tkinter as tk
+from tkinter import messagebox, scrolledtext, ttk
 
-try:
-    from peft import LoraConfig, get_peft_model
-except ImportError:
-    LoraConfig = None
-    get_peft_model = None
+import requests
+
+# ---------------------------
+# Config – adjust to your setup
+# ---------------------------
+
+TRAINER_URL = "http://localhost:5001"  # trainer/server base URL
+INFERENCE_URL = "http://localhost:5000/generate"  # inference API for live test calls
+WORKER_CMD = ["python", "-m", "actors.worker", "--trainer-url", TRAINER_URL]
+
+STATUS_ENDPOINT = "/worker_status"
+STARTER_TEST_ENDPOINT = "/run_starter_test"
+
+# Endpoints for queue + cluster management.
+QUEUE_STATUS_ENDPOINT = "/queue_status"
+ENQUEUE_BLOCKS_ENDPOINT = "/enqueue_blocks"
+CLUSTER_STATUS_ENDPOINT = "/cluster_status"
+DISABLE_NODE_ENDPOINT = "/disable_node"
+ENABLE_NODE_ENDPOINT = "/enable_node"
 
 
-def latest_checkpoint(output_dir: Path) -> str | None:
-    """Return the latest checkpoint path in output_dir, or None if none exist."""
-    candidates = []
-    for path in output_dir.glob("checkpoint-*"):
+class CommandStation(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Training Command Station")
+        self.geometry("1200x700")
+
+        self.worker_process = None
+        self.log_queue = queue.Queue()
+
+        self._build_layout()
+
+        # Periodic background polling.
+        self.after(2000, self._poll_status_loop)
+        self.after(250, self._poll_log_queue)
+
+    # Layout -------------------------------------------------------------
+    def _build_layout(self):
+        # ---------------- Top: node + model + controls -----------------
+        top_frame = ttk.Frame(self)
+        top_frame.pack(fill="x", padx=10, pady=10)
+
+        # Node status
+        node_frame = ttk.LabelFrame(top_frame, text="Node Status")
+        node_frame.pack(side="left", fill="both", expand=True, padx=5)
+
+        self.node_status_var = tk.StringVar(value="Stopped")
+        self.node_id_var = tk.StringVar(value="unknown")
+        self.trainer_url_var = tk.StringVar(value=TRAINER_URL)
+        self.inference_url_var = tk.StringVar(value=INFERENCE_URL)
+
+        ttk.Label(node_frame, text="Node ID:").grid(row=0, column=0, sticky="w")
+        ttk.Label(node_frame, textvariable=self.node_id_var).grid(row=0, column=1, sticky="w")
+
+        ttk.Label(node_frame, text="Status:").grid(row=1, column=0, sticky="w")
+        # keep a handle so we can color it
+        self.node_status_label = ttk.Label(node_frame, textvariable=self.node_status_var)
+        self.node_status_label.grid(row=1, column=1, sticky="w")
+
+        ttk.Label(node_frame, text="Trainer URL:").grid(row=2, column=0, sticky="w")
+        trainer_entry = ttk.Entry(node_frame, textvariable=self.trainer_url_var, width=40)
+        trainer_entry.grid(row=2, column=1, sticky="w")
+
+        ttk.Label(node_frame, text="Inference URL:").grid(row=3, column=0, sticky="w")
+        infer_entry = ttk.Entry(node_frame, textvariable=self.inference_url_var, width=40)
+        infer_entry.grid(row=3, column=1, sticky="w")
+
+        # Model status
+        model_frame = ttk.LabelFrame(top_frame, text="Model / Adapter")
+        model_frame.pack(side="left", fill="both", expand=True, padx=5)
+
+        self.base_version_var = tk.StringVar(value="-")
+        self.adapter_name_var = tk.StringVar(value="-")
+        self.quantization_var = tk.StringVar(value="-")
+        self.flash_var = tk.StringVar(value="-")
+        self.compile_var = tk.StringVar(value="-")
+        self.blocks_processed_var = tk.StringVar(value="0")
+
+        row = 0
+        ttk.Label(model_frame, text="Base version:").grid(row=row, column=0, sticky="w")
+        ttk.Label(model_frame, textvariable=self.base_version_var).grid(row=row, column=1, sticky="w")
+        row += 1
+
+        ttk.Label(model_frame, text="Adapter:").grid(row=row, column=0, sticky="w")
+        ttk.Label(model_frame, textvariable=self.adapter_name_var).grid(row=row, column=1, sticky="w")
+        row += 1
+
+        ttk.Label(model_frame, text="Quantization:").grid(row=row, column=0, sticky="w")
+        ttk.Label(model_frame, textvariable=self.quantization_var).grid(row=row, column=1, sticky="w")
+        row += 1
+
+        ttk.Label(model_frame, text="Flash Attn:").grid(row=row, column=0, sticky="w")
+        ttk.Label(model_frame, textvariable=self.flash_var).grid(row=row, column=1, sticky="w")
+        row += 1
+
+        ttk.Label(model_frame, text="torch.compile:").grid(row=row, column=0, sticky="w")
+        ttk.Label(model_frame, textvariable=self.compile_var).grid(row=row, column=1, sticky="w")
+        row += 1
+
+        ttk.Label(model_frame, text="Blocks processed:").grid(row=row, column=0, sticky="w")
+        ttk.Label(model_frame, textvariable=self.blocks_processed_var).grid(row=row, column=1, sticky="w")
+        row += 1
+
+        # Control buttons
+        control_frame = ttk.Frame(top_frame)
+        control_frame.pack(side="right", fill="y", padx=5)
+
+        ttk.Button(control_frame, text="Start Worker", command=self.start_worker).pack(fill="x", pady=2)
+        ttk.Button(control_frame, text="Stop Worker", command=self.stop_worker).pack(fill="x", pady=2)
+        ttk.Button(control_frame, text="Refresh Status", command=self.refresh_status).pack(fill="x", pady=2)
+        ttk.Button(control_frame, text="Run Starter Block Test", command=self.run_starter_test).pack(
+            fill="x", pady=8
+        )
+
+        # ---------------- Middle: assigned blocks + logs ----------------
+        middle_frame = ttk.PanedWindow(self, orient="horizontal")
+        middle_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        blocks_frame = ttk.LabelFrame(middle_frame, text="Assigned Blocks (this node)")
+        middle_frame.add(blocks_frame, weight=3)
+
+        columns = ("block_id", "status", "loss", "updated_at")
+        style = ttk.Style(self)
+        style.configure("Blocks.Treeview", rowheight=24)
+
+        self.blocks_tree = ttk.Treeview(
+            blocks_frame, columns=columns, show="headings", height=8, style="Blocks.Treeview"
+        )
+        for col in columns:
+            self.blocks_tree.heading(col, text=col)
+            self.blocks_tree.column(col, width=140)
+        self.blocks_tree.pack(fill="both", expand=True)
+
+        log_frame = ttk.LabelFrame(middle_frame, text="Logs")
+        middle_frame.add(log_frame, weight=2)
+
+        self.log_text = scrolledtext.ScrolledText(log_frame, wrap="word", state="disabled")
+        self.log_text.pack(fill="both", expand=True)
+
+        # ---------------- Cluster Nodes panel ----------------
+        cluster_frame = ttk.LabelFrame(self, text="Cluster Nodes")
+        cluster_frame.pack(fill="both", expand=False, padx=10, pady=5)
+
+        cluster_inner = ttk.Frame(cluster_frame)
+        cluster_inner.pack(fill="both", expand=True)
+
+        cluster_columns = ("node_id", "state", "blocks_done", "trust", "last_seen")
+        self.cluster_tree = ttk.Treeview(
+            cluster_inner, columns=cluster_columns, show="headings", height=6
+        )
+        for col in cluster_columns:
+            self.cluster_tree.heading(col, text=col)
+            width = 140 if col != "last_seen" else 200
+            self.cluster_tree.column(col, width=width)
+        self.cluster_tree.pack(side="left", fill="both", expand=True)
+
+        # Color tags for cluster nodes (background by state)
+        self.cluster_tree.tag_configure("state_idle", background="#203820")       # dark-ish green
+        self.cluster_tree.tag_configure("state_training", background="#203048")   # dark-ish blue
+        self.cluster_tree.tag_configure("state_error", background="#3a2020")      # dark-ish red
+        self.cluster_tree.tag_configure("state_disabled", background="#303030")   # gray
+
+        # Foreground by trust score
+        self.cluster_tree.tag_configure("trust_low", foreground="#ff6b6b")        # red
+        self.cluster_tree.tag_configure("trust_mid", foreground="#ffb86c")        # orange
+
+        cluster_btns = ttk.Frame(cluster_inner)
+        cluster_btns.pack(side="right", fill="y", padx=5)
+
+        ttk.Button(cluster_btns, text="Refresh Cluster", command=self.refresh_cluster_status).pack(
+            fill="x", pady=2
+        )
+        ttk.Button(cluster_btns, text="Disable Node", command=self.disable_selected_node).pack(
+            fill="x", pady=2
+        )
+        ttk.Button(cluster_btns, text="Enable Node", command=self.enable_selected_node).pack(
+            fill="x", pady=2
+        )
+
+        # ---------------- Bottom: block builder + queue + inference -----
+        bottom_frame = ttk.Frame(self)
+        bottom_frame.pack(fill="both", expand=False, padx=10, pady=5)
+
+        # Block builder
+        builder_frame = ttk.LabelFrame(bottom_frame, text="Block Builder (local)")
+        builder_frame.pack(side="left", fill="both", expand=True, padx=5)
+
+        self.input_path_var = tk.StringVar(value="data/raw/ebooks")
+        self.output_path_var = tk.StringVar(
+            value="data/processed/experience_blocks.jsonl"
+        )
+        self.dataset_label_var = tk.StringVar(value="dev_dataset")
+        self.block_adapter_var = tk.StringVar(value="")
+
+        ttk.Label(builder_frame, text="Input path/file:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(builder_frame, textvariable=self.input_path_var, width=40).grid(
+            row=0, column=1, sticky="we"
+        )
+
+        ttk.Label(builder_frame, text="Output blocks file:").grid(row=1, column=0, sticky="w")
+        ttk.Entry(builder_frame, textvariable=self.output_path_var, width=40).grid(
+            row=1, column=1, sticky="we"
+        )
+
+        ttk.Label(builder_frame, text="Dataset label:").grid(row=2, column=0, sticky="w")
+        ttk.Entry(builder_frame, textvariable=self.dataset_label_var, width=25).grid(
+            row=2, column=1, sticky="w"
+        )
+
+        ttk.Label(builder_frame, text="Target adapter (optional):").grid(
+            row=3, column=0, sticky="w"
+        )
+        ttk.Entry(builder_frame, textvariable=self.block_adapter_var, width=25).grid(
+            row=3, column=1, sticky="w"
+        )
+
+        ttk.Button(builder_frame, text="Build Blocks Locally", command=self.run_block_builder).grid(
+            row=4, column=0, columnspan=2, sticky="we", pady=4
+        )
+
+        # Block queue controls (talks to trainer)
+        queue_frame = ttk.LabelFrame(bottom_frame, text="Global Block Queue")
+        queue_frame.pack(side="left", fill="both", expand=True, padx=5)
+
+        # Summary labels
+        self.queue_total_var = tk.StringVar(value="0")
+        self.queue_pending_var = tk.StringVar(value="0")
+        self.queue_assigned_var = tk.StringVar(value="0")
+        self.queue_completed_var = tk.StringVar(value="0")
+        self.queue_failed_var = tk.StringVar(value="0")
+
+        qrow = 0
+        ttk.Label(queue_frame, text="Total:").grid(row=qrow, column=0, sticky="w")
+        ttk.Label(queue_frame, textvariable=self.queue_total_var).grid(row=qrow, column=1, sticky="w")
+        ttk.Label(queue_frame, text="Pending:").grid(row=qrow, column=2, sticky="w")
+        ttk.Label(queue_frame, textvariable=self.queue_pending_var).grid(row=qrow, column=3, sticky="w")
+        qrow += 1
+
+        ttk.Label(queue_frame, text="Assigned:").grid(row=qrow, column=0, sticky="w")
+        ttk.Label(queue_frame, textvariable=self.queue_assigned_var).grid(row=qrow, column=1, sticky="w")
+        ttk.Label(queue_frame, text="Completed:").grid(row=qrow, column=2, sticky="w")
+        ttk.Label(queue_frame, textvariable=self.queue_completed_var).grid(row=qrow, column=3, sticky="w")
+        qrow += 1
+
+        ttk.Label(queue_frame, text="Failed:").grid(row=qrow, column=0, sticky="w")
+        ttk.Label(queue_frame, textvariable=self.queue_failed_var).grid(row=qrow, column=1, sticky="w")
+        qrow += 1
+
+        ttk.Button(queue_frame, text="Refresh Queue", command=self.refresh_queue_status).grid(
+            row=qrow, column=0, columnspan=2, sticky="we", pady=2
+        )
+        ttk.Button(queue_frame, text="Enqueue Output Blocks", command=self.enqueue_blocks).grid(
+            row=qrow, column=2, columnspan=2, sticky="we", pady=2
+        )
+        qrow += 1
+
+        queue_columns = ("block_id", "task", "status", "assigned_to", "updated_at")
+        self.queue_tree = ttk.Treeview(
+            queue_frame, columns=queue_columns, show="headings", height=6
+        )
+        for col in queue_columns:
+            self.queue_tree.heading(col, text=col)
+            width = 120 if col != "updated_at" else 160
+            self.queue_tree.column(col, width=width)
+        self.queue_tree.grid(row=qrow, column=0, columnspan=4, sticky="nsew")
+        queue_frame.rowconfigure(qrow, weight=1)
+        queue_frame.columnconfigure(1, weight=1)
+
+        # Live inference test
+        infer_frame = ttk.LabelFrame(bottom_frame, text="Live Model Test")
+        infer_frame.pack(side="right", fill="both", expand=True, padx=5)
+
+        self.test_persona = tk.StringVar(value="tester_npc")
+        self.test_context = tk.StringVar(value="town square")
+        self.test_state = tk.StringVar(value="idle")
+        self.test_player = tk.StringVar(value="Hello there")
+        self.test_adapter_name = tk.StringVar(value="")
+
+        ttk.Label(infer_frame, text="Adapter name:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(infer_frame, textvariable=self.test_adapter_name, width=25).grid(
+            row=0, column=1, sticky="we"
+        )
+
+        ttk.Label(infer_frame, text="Persona:").grid(row=1, column=0, sticky="w")
+        ttk.Entry(infer_frame, textvariable=self.test_persona, width=25).grid(
+            row=1, column=1, sticky="we"
+        )
+
+        ttk.Label(infer_frame, text="Context:").grid(row=2, column=0, sticky="w")
+        ttk.Entry(infer_frame, textvariable=self.test_context, width=25).grid(
+            row=2, column=1, sticky="we"
+        )
+
+        ttk.Label(infer_frame, text="State:").grid(row=3, column=0, sticky="w")
+        ttk.Entry(infer_frame, textvariable=self.test_state, width=25).grid(
+            row=3, column=1, sticky="we"
+        )
+
+        ttk.Label(infer_frame, text="Player input:").grid(row=4, column=0, sticky="w")
+        ttk.Entry(infer_frame, textvariable=self.test_player, width=40).grid(
+            row=4, column=1, sticky="we"
+        )
+
+        ttk.Button(infer_frame, text="Send to Model", command=self.run_live_inference).grid(
+            row=5, column=0, columnspan=2, sticky="we", pady=4
+        )
+
+        # initial color for node status
+        self._update_node_status_style()
+
+    # Worker control -----------------------------------------------------
+    def start_worker(self):
+        if self.worker_process and self.worker_process.poll() is None:
+            messagebox.showinfo("Worker", "Worker is already running.")
+            return
+        self._log("Starting worker process...")
         try:
-            step = int(path.name.split("-")[-1])
-            candidates.append((step, path))
-        except ValueError:
-            continue
-    if not candidates:
-        return None
-    _, ckpt_path = max(candidates, key=lambda x: x[0])
-    return str(ckpt_path)
+            self.worker_process = subprocess.Popen(
+                WORKER_CMD,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            threading.Thread(target=self._stream_worker_logs, daemon=True).start()
+            self.node_status_var.set("starting")
+            self._update_node_status_style()
+        except Exception as e:
+            self._log(f"Failed to start worker: {e}")
+            messagebox.showerror("Error", f"Failed to start worker:\n{e}")
 
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Train a causal LM on local data.")
-    parser.add_argument(
-        "--model-name",
-        default="meta-llama/Llama-2-13b-hf",
-        help="Base model name or path.",
-    )
-    parser.add_argument(
-        "--data-file",
-        default="data/raw/wikipedia-en-0.json",
-        help="Path to a JSON array of strings for training.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default="models/checkpoints",
-        help="Where to store training checkpoints.",
-    )
-    parser.add_argument(
-        "--save-final-to",
-        default="models/latest",
-        help="Directory to save final model/tokenizer.",
-    )
-    parser.add_argument(
-        "--adapter-dir",
-        default="models/adapters",
-        help="Directory to save LoRA adapters (when enabled).",
-    )
-    parser.add_argument(
-        "--adapter-name",
-        default="lora_adapter",
-        help="Adapter name (subdirectory under adapter-dir when using LoRA).",
-    )
-    parser.add_argument(
-        "--log-dir",
-        default="logs/training",
-        help="Directory for trainer logs.",
-    )
-    parser.add_argument(
-        "--log-to",
-        default="none",
-        choices=["none", "tensorboard", "wandb"],
-        help="Where to report metrics.",
-    )
-    parser.add_argument(
-        "--hf-push",
-        action="store_true",
-        help="Push final model/adapter to Hugging Face Hub (requires token configured).",
-    )
-    parser.add_argument(
-        "--resume-latest",
-        action="store_true",
-        help="If set, resume from the latest checkpoint in output-dir.",
-    )
-    parser.add_argument(
-        "--use-lora",
-        action="store_true",
-        help="Enable LoRA adapter training instead of full fine-tuning.",
-    )
-    parser.add_argument("--learning-rate", type=float, default=2e-5, help="Learning rate.")
-    parser.add_argument(
-        "--num-epochs", type=int, default=3, help="Number of training epochs."
-    )
-    parser.add_argument(
-        "--per-device-train-batch-size",
-        type=int,
-        default=2,
-        help="Per-device train batch size.",
-    )
-    parser.add_argument(
-        "--per-device-eval-batch-size",
-        type=int,
-        default=2,
-        help="Per-device eval batch size.",
-    )
-    parser.add_argument(
-        "--gradient-accumulation-steps",
-        type=int,
-        default=1,
-        help="Gradient accumulation steps.",
-    )
-    parser.add_argument(
-        "--warmup-steps", type=int, default=100, help="Number of warmup steps."
-    )
-    parser.add_argument(
-        "--lr-scheduler-type",
-        default="linear",
-        help="LR scheduler type (linear, cosine, cosine_with_restarts, etc.).",
-    )
-    parser.add_argument(
-        "--weight-decay", type=float, default=0.01, help="Weight decay."
-    )
-    parser.add_argument(
-        "--adam-beta1", type=float, default=0.9, help="Adam beta1."
-    )
-    parser.add_argument(
-        "--adam-beta2", type=float, default=0.98, help="Adam beta2."
-    )
-    parser.add_argument(
-        "--max-grad-norm", type=float, default=1.0, help="Max gradient norm for clipping."
-    )
-    parser.add_argument(
-        "--early-stop-patience",
-        type=int,
-        default=0,
-        help="Early stopping patience in eval steps (0 to disable).",
-    )
-    parser.add_argument(
-        "--bf16",
-        action="store_true",
-        help="Force bfloat16 mixed precision when supported (recommended for Ampere+).",
-    )
-    parser.add_argument(
-        "--enable-flash-attn",
-        action="store_true",
-        help="Enable PyTorch flash/mem-efficient attention kernels (requires compatible GPU/torch).",
-    )
-    parser.add_argument("--lora-r", type=int, default=8, help="LoRA rank.")
-    parser.add_argument(
-        "--lora-alpha", type=int, default=16, help="LoRA alpha (scaling)."
-    )
-    parser.add_argument(
-        "--lora-dropout", type=float, default=0.05, help="LoRA dropout rate."
-    )
-    parser.add_argument(
-        "--lora-target-modules",
-        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
-        help="Comma-separated target modules for LoRA.",
-    )
-    return parser.parse_args()
-
-
-def train():
-    args = parse_args()
-
-    model_name = args.model_name
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name, use_fast=True, trust_remote_code=True
-    )
-
-    # Use EOS as padding to avoid padding errors and expand embeddings to include it
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    torch_dtype = None
-    if torch.cuda.is_available():
-        if args.bf16 and torch.cuda.is_bf16_supported():
-            torch_dtype = torch.bfloat16
+    def stop_worker(self):
+        if self.worker_process and self.worker_process.poll() is None:
+            self._log("Stopping worker process...")
+            self.worker_process.terminate()
+            try:
+                self.worker_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._log("Worker did not exit, killing...")
+                self.worker_process.kill()
+            self.node_status_var.set("stopped")
+            self._update_node_status_style()
+            self._log("Worker stopped.")
         else:
-            torch_dtype = torch.float16
+            messagebox.showinfo("Worker", "Worker is not running.")
 
-    if args.enable_flash_attn and torch.cuda.is_available():
-        try:
-            torch.backends.cuda.enable_flash_sdp(True)
-            torch.backends.cuda.enable_math_sdp(False)
-            torch.backends.cuda.enable_mem_efficient_sdp(True)
-        except Exception:
-            pass
+    def _stream_worker_logs(self):
+        if not self.worker_process or not self.worker_process.stdout:
+            return
+        for line in self.worker_process.stdout:
+            if not line:
+                break
+            self.log_queue.put(line.rstrip("\n"))
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name, trust_remote_code=True, torch_dtype=torch_dtype
-    )
-    model.resize_token_embeddings(len(tokenizer))
-    model.config.pad_token_id = tokenizer.pad_token_id
+    # Status polling -----------------------------------------------------
+    def _poll_status_loop(self):
+        # Called periodically; fan out to all status refreshers.
+        self.refresh_status(background=True)
+        self.refresh_queue_status(background=True)
+        self.refresh_cluster_status(background=True)
+        self.after(4000, self._poll_status_loop)
 
-    if args.use_lora:
-        if LoraConfig is None or get_peft_model is None:
-            raise ImportError("peft is required for LoRA; install with `pip install peft`.")
-        target_modules = [m.strip() for m in args.lora_target_modules.split(",") if m.strip()]
-        lora_config = LoraConfig(
-            r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            target_modules=target_modules,
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        model = get_peft_model(model, lora_config)
+    def refresh_status(self, background=False):
+        def _task():
+            try:
+                url = self.trainer_url_var.get().rstrip("/") + STATUS_ENDPOINT
+                resp = requests.get(url, timeout=3)
+                resp.raise_for_status()
+                status = resp.json()
+                self._update_status_from_json(status)
+            except Exception as e:
+                if not background:
+                    messagebox.showerror("Status Error", f"Failed to fetch status:\n{e}")
+                self._log(f"Status fetch failed: {e}")
 
-    # Load JSON array of strings as text dataset
-    raw_datasets = load_dataset("json", data_files=args.data_file, split="train")
+        threading.Thread(target=_task, daemon=True).start()
 
-    # Create a small validation slice to monitor training
-    split_datasets = raw_datasets.train_test_split(test_size=0.01, seed=42)
+    def _update_status_from_json(self, status):
+        self.node_id_var.set(status.get("node_id", "unknown"))
+        self.node_status_var.set(status.get("state", "unknown"))
+        self._update_node_status_style()
 
-    def tokenize_function(examples):
-        return tokenizer(
-            examples["text"],
-            truncation=True,
-            max_length=1024,
-        )
+        self.base_version_var.set(str(status.get("base_model_version", "-")))
+        self.adapter_name_var.set(status.get("adapter_name", "-"))
+        self.quantization_var.set(status.get("quantization", "-"))
+        self.flash_var.set(str(status.get("use_flash_attn", False)))
+        self.compile_var.set(str(status.get("compile_model", False)))
+        self.blocks_processed_var.set(str(status.get("blocks_processed", 0)))
 
-    tokenized_datasets = split_datasets.map(
-        tokenize_function, batched=True, remove_columns=["text"]
-    )
+        # Assigned blocks for this node.
+        for row in self.blocks_tree.get_children():
+            self.blocks_tree.delete(row)
+        for blk in status.get("blocks", []):
+            self.blocks_tree.insert(
+                "",
+                "end",
+                values=(
+                    blk.get("block_id", ""),
+                    blk.get("status", ""),
+                    blk.get("loss", ""),
+                    blk.get("updated_at", ""),
+                ),
+            )
 
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    def _update_node_status_style(self):
+        """Color-code the node status label by state."""
+        state = (self.node_status_var.get() or "").lower()
+        # Default colors that look okay on dark themes too
+        if state in ("idle", "ready"):
+            fg = "#7CFC00"  # bright green
+        elif state in ("training", "busy"):
+            fg = "#00BFFF"  # deep sky blue
+        elif state in ("starting", "connecting"):
+            fg = "#FFD700"  # gold
+        elif state in ("error", "failed", "disconnected"):
+            fg = "#FF4500"  # orange-red
+        elif state in ("stopped", "unknown"):
+            fg = "#AAAAAA"  # gray
+        else:
+            fg = "#FFFFFF"  # default white
+        # ttk.Label doesn't expose fg directly; use underlying style map
+        style = ttk.Style()
+        style_name = "NodeStatus.TLabel"
+        style.configure(style_name, foreground=fg)
+        self.node_status_label.configure(style=style_name)
 
-    output_dir = Path(args.output_dir)
-    log_dir = Path(args.log_dir)
+    # Queue status -------------------------------------------------------
+    def refresh_queue_status(self, background=False):
+        def _task():
+            try:
+                url = self.trainer_url_var.get().rstrip("/") + QUEUE_STATUS_ENDPOINT
+                resp = requests.get(url, timeout=5)
+                resp.raise_for_status()
+                data = resp.json()
+                self._update_queue_from_json(data)
+            except Exception as e:
+                if not background:
+                    messagebox.showerror("Queue Error", f"Failed to fetch queue status:\n{e}")
+                self._log(f"Queue status fetch failed: {e}")
 
-    if args.log_to == "wandb":
-        os.environ.setdefault("WANDB_PROJECT", "zykeAI")
-        os.environ.setdefault("WANDB_MODE", "online")
-        report_to = ["wandb"]
-    elif args.log_to == "tensorboard":
-        report_to = ["tensorboard"]
-    else:
-        report_to = ["none"]
+        threading.Thread(target=_task, daemon=True).start()
 
-    training_args = TrainingArguments(
-        output_dir=str(output_dir),
-        num_train_epochs=args.num_epochs,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        per_device_eval_batch_size=args.per_device_eval_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        evaluation_strategy="steps",
-        eval_steps=1000,
-        save_steps=1000,
-        save_total_limit=3,
-        logging_steps=200,
-        fp16=torch.cuda.is_available() and not (args.bf16 and torch.cuda.is_bf16_supported()),
-        bf16=torch.cuda.is_available() and args.bf16 and torch.cuda.is_bf16_supported(),
-        report_to=report_to,
-        logging_dir=str(log_dir),
-        learning_rate=args.learning_rate,
-        warmup_steps=args.warmup_steps,
-        lr_scheduler_type=args.lr_scheduler_type,
-        weight_decay=args.weight_decay,
-        adam_beta1=args.adam_beta1,
-        adam_beta2=args.adam_beta2,
-        max_grad_norm=args.max_grad_norm,
-    )
+    def _update_queue_from_json(self, data):
+        self.queue_total_var.set(str(data.get("total", 0)))
+        self.queue_pending_var.set(str(data.get("pending", 0)))
+        self.queue_assigned_var.set(str(data.get("assigned", 0)))
+        self.queue_completed_var.set(str(data.get("completed", 0)))
+        self.queue_failed_var.set(str(data.get("failed", 0)))
 
-    callbacks = []
-    if args.early_stop_patience > 0:
-        callbacks.append(EarlyStoppingCallback(early_stopping_patience=args.early_stop_patience))
+        for row in self.queue_tree.get_children():
+            self.queue_tree.delete(row)
+        for blk in data.get("blocks", []):
+            self.queue_tree.insert(
+                "",
+                "end",
+                values=(
+                    blk.get("block_id", ""),
+                    blk.get("task", ""),
+                    blk.get("status", ""),
+                    blk.get("assigned_to", ""),
+                    blk.get("updated_at", ""),
+                ),
+            )
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized_datasets["train"],
-        eval_dataset=tokenized_datasets["test"],
-        data_collator=data_collator,
-        callbacks=callbacks,
-    )
-
-    resume_from = latest_checkpoint(output_dir) if args.resume_latest else None
-    if resume_from:
-        print(f"Resuming from checkpoint: {resume_from}")
-
-    trainer.train(resume_from_checkpoint=resume_from)
-
-    if args.use_lora:
-        final_dir = Path(args.adapter_dir) / args.adapter_name
-        final_dir.mkdir(parents=True, exist_ok=True)
-        # Save only the adapter weights and tokenizer for portability
-        model.save_pretrained(str(final_dir))
-        tokenizer.save_pretrained(str(final_dir))
-        # Manifest to describe compatibility
-        manifest = {
-            "base_model": model_name,
-            "adapter_name": args.adapter_name,
-            "lora_r": args.lora_r,
-            "lora_alpha": args.lora_alpha,
-            "lora_dropout": args.lora_dropout,
-            "target_modules": [m for m in args.lora_target_modules.split(",") if m.strip()],
-            "data_file": args.data_file,
+    def enqueue_blocks(self):
+        """
+        Enqueue the blocks file produced by run_block_builder into the trainer's global queue.
+        Trainer-side /enqueue_blocks should accept:
+        {
+          "dataset_label": "...",
+          "blocks_path": "...",
+          "target_adapter": "optional"
         }
-        (final_dir / "adapter_manifest.json").write_text(
-            __import__("json").dumps(manifest, indent=2)
-        )
-        print(f"LoRA adapter and tokenizer saved to {final_dir}")
-        if args.hf_push:
+        """
+        def _task():
+            payload = {
+                "dataset_label": self.dataset_label_var.get(),
+                "blocks_path": self.output_path_var.get(),
+                "target_adapter": self.block_adapter_var.get() or None,
+            }
+            self._log(f"Enqueuing blocks to trainer: {payload}")
             try:
-                trainer.push_to_hub()
-            except Exception as exc:  # pragma: no cover - diagnostic
-                print(f"Hub push failed: {exc}")
-    else:
-        final_dir = Path(args.save_final_to)
-        trainer.save_model(str(final_dir))
-        tokenizer.save_pretrained(str(final_dir))
-        print(f"Model and tokenizer saved to {final_dir}")
-        if args.hf_push:
+                url = self.trainer_url_var.get().rstrip("/") + ENQUEUE_BLOCKS_ENDPOINT
+                resp = requests.post(url, json=payload, timeout=10)
+                resp.raise_for_status()
+                data = resp.json()
+                msg = data.get("message", "Blocks enqueued.")
+                self._log(msg)
+                messagebox.showinfo("Enqueue Blocks", msg)
+                # Refresh queue after enqueue
+                self.refresh_queue_status(background=True)
+            except Exception as e:
+                self._log(f"Enqueue failed: {e}")
+                messagebox.showerror("Enqueue Error", f"{e}")
+
+        threading.Thread(target=_task, daemon=True).start()
+
+    # Cluster status -----------------------------------------------------
+    def refresh_cluster_status(self, background=False):
+        def _task():
             try:
-                trainer.push_to_hub()
-            except Exception as exc:  # pragma: no cover - diagnostic
-                print(f"Hub push failed: {exc}")
+                url = self.trainer_url_var.get().rstrip("/") + CLUSTER_STATUS_ENDPOINT
+                resp = requests.get(url, timeout=5)
+                resp.raise_for_status()
+                data = resp.json()
+                self._update_cluster_from_json(data)
+            except Exception as e:
+                if not background:
+                    messagebox.showerror("Cluster Error", f"Failed to fetch cluster status:\n{e}")
+                self._log(f"Cluster status fetch failed: {e}")
+
+        threading.Thread(target=_task, daemon=True).start()
+
+    def _update_cluster_from_json(self, data):
+        for row in self.cluster_tree.get_children():
+            self.cluster_tree.delete(row)
+        for node in data.get("nodes", []):
+            node_id = node.get("node_id", "")
+            state = (node.get("state", "") or "").lower()
+            blocks_completed = node.get("blocks_completed", 0)
+            trust = node.get("trust_score", 0.0)
+            last_seen = node.get("last_seen", "")
+
+            tags = []
+
+            # Background by state
+            if state in ("idle", "ready"):
+                tags.append("state_idle")
+            elif state in ("training", "busy"):
+                tags.append("state_training")
+            elif state in ("error", "failed", "disconnected"):
+                tags.append("state_error")
+            elif state in ("disabled", "offline"):
+                tags.append("state_disabled")
+
+            # Foreground by trust
+            try:
+                t_val = float(trust)
+            except Exception:
+                t_val = 0.0
+            if t_val < 0.4:
+                tags.append("trust_low")
+            elif t_val < 0.7:
+                tags.append("trust_mid")
+
+            self.cluster_tree.insert(
+                "",
+                "end",
+                values=(node_id, state, blocks_completed, t_val, last_seen),
+                tags=tuple(tags),
+            )
+
+    def _get_selected_cluster_node_id(self):
+        sel = self.cluster_tree.selection()
+        if not sel:
+            messagebox.showinfo("Cluster", "Select a node first.")
+            return None
+        item = self.cluster_tree.item(sel[0])
+        values = item.get("values", [])
+        if not values:
+            return None
+        return values[0]
+
+    def disable_selected_node(self):
+        node_id = self._get_selected_cluster_node_id()
+        if not node_id:
+            return
+
+        def _task():
+            self._log(f"Disabling node {node_id}...")
+            try:
+                url = self.trainer_url_var.get().rstrip("/") + DISABLE_NODE_ENDPOINT
+                resp = requests.post(url, json={"node_id": node_id}, timeout=5)
+                resp.raise_for_status()
+                data = resp.json()
+                msg = data.get("message", f"Node {node_id} disabled.")
+                self._log(msg)
+                messagebox.showinfo("Disable Node", msg)
+                self.refresh_cluster_status(background=True)
+            except Exception as e:
+                self._log(f"Disable node failed: {e}")
+                messagebox.showerror("Disable Node Error", f"{e}")
+
+        threading.Thread(target=_task, daemon=True).start()
+
+    def enable_selected_node(self):
+        node_id = self._get_selected_cluster_node_id()
+        if not node_id:
+            return
+
+        def _task():
+            self._log(f"Enabling node {node_id}...")
+            try:
+                url = self.trainer_url_var.get().rstrip("/") + ENABLE_NODE_ENDPOINT
+                resp = requests.post(url, json={"node_id": node_id}, timeout=5)
+                resp.raise_for_status()
+                data = resp.json()
+                msg = data.get("message", f"Node {node_id} enabled.")
+                self._log(msg)
+                messagebox.showinfo("Enable Node", msg)
+                self.refresh_cluster_status(background=True)
+            except Exception as e:
+                self._log(f"Enable node failed: {e}")
+                messagebox.showerror("Enable Node Error", f"{e}")
+
+        threading.Thread(target=_task, daemon=True).start()
+
+    # Starter block test -------------------------------------------------
+    def run_starter_test(self):
+        def _task():
+            self._log("Running starter-block smoke test...")
+            try:
+                url = self.trainer_url_var.get().rstrip("/") + STARTER_TEST_ENDPOINT
+                resp = requests.post(url, timeout=60)
+                resp.raise_for_status()
+                data = resp.json()
+                ok = data.get("ok", False)
+                msg = data.get("message", "no message")
+                if ok:
+                    self._log(f"Starter test OK: {msg}")
+                    messagebox.showinfo("Starter Test", f"Success:\n{msg}")
+                else:
+                    self._log(f"Starter test FAILED: {msg}")
+                    messagebox.showwarning("Starter Test", f"FAILED:\n{msg}")
+            except Exception as e:
+                self._log(f"Starter test error: {e}")
+                messagebox.showerror("Starter Test Error", f"Error:\n{e}")
+
+        threading.Thread(target=_task, daemon=True).start()
+
+    # Logging ------------------------------------------------------------
+    def _log(self, msg: str):
+        timestamp = time.strftime("%H:%M:%S")
+        self.log_queue.put(f"[{timestamp}] {msg}")
+
+    def _poll_log_queue(self):
+        try:
+            while True:
+                msg = self.log_queue.get_nowait()
+                self._append_log(msg)
+        except queue.Empty:
+            pass
+        self.after(250, self._poll_log_queue)
+
+    def _append_log(self, msg: str):
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", msg + "\n")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+    # Block builder ------------------------------------------------------
+    def run_block_builder(self):
+        def _task():
+            cmd = [
+                "python",
+                "data/make_experience_blocks.py",
+                "--input-path",
+                self.input_path_var.get(),
+                "--output",
+                self.output_path_var.get(),
+            ]
+            self._log(f"Building blocks: {' '.join(cmd)}")
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                out = proc.stdout.strip() or "Block build complete."
+                self._log(out)
+                messagebox.showinfo("Block Builder", out)
+            except subprocess.CalledProcessError as e:
+                err = e.stderr or str(e)
+                self._log(f"Block build failed: {err}")
+                messagebox.showerror("Block Build Error", err)
+
+        threading.Thread(target=_task, daemon=True).start()
+
+    # Live inference -----------------------------------------------------
+    def run_live_inference(self):
+        def _task():
+            payload = {
+                "persona": self.test_persona.get(),
+                "context": self.test_context.get(),
+                "state": self.test_state.get(),
+                "player_input": self.test_player.get(),
+            }
+            if self.test_adapter_name.get():
+                payload["adapter_name"] = self.test_adapter_name.get()
+            try:
+                url = self.inference_url_var.get().rstrip("/")
+                resp = requests.post(url, json=payload, timeout=20)
+                resp.raise_for_status()
+                data = resp.json()
+                self._log(f"Inference response: {data}")
+            except Exception as e:
+                self._log(f"Inference error: {e}")
+                messagebox.showerror("Inference Error", f"{e}")
+
+        threading.Thread(target=_task, daemon=True).start()
+
+
+def main():
+    app = CommandStation()
+    app.mainloop()
 
 
 if __name__ == "__main__":
-    train()
+    main()

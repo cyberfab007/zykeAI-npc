@@ -9,3 +9,4 @@ bitsandbytes
 sentencepiece
 requests
 prometheus_client
+gunicorn

@@ -1,0 +1,47 @@
+{
+  "npc_core_v1": {
+    "name": "npc_core_v1",
+    "adapter_path": "models/adapters/npc_core_v1",
+    "base_model": "meta-llama/LLaMA-2-13b-hf",
+    "target_modules": ["q_proj", "v_proj"],
+    "r": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05,
+    "version": "0.1.0",
+    "hf_repo_id": "your-org/npc_core_v1",
+    "task": "npc_general",
+    "audience": "general",
+    "description": "General NPC behavior and schema adherence.",
+    "tags": ["npc", "core", "general"]
+  },
+  "religion_christian_v1": {
+    "name": "religion_christian_v1",
+    "adapter_path": "models/adapters/religion_christian_v1",
+    "base_model": "meta-llama/LLaMA-2-13b-hf",
+    "target_modules": ["q_proj", "v_proj"],
+    "r": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05,
+    "version": "0.1.0",
+    "hf_repo_id": "your-org/religion_christian_v1",
+    "task": "npc_religion",
+    "audience": "teen",
+    "description": "Christian lore/style adapter for priests/monks/paladins NPCs.",
+    "tags": ["npc", "religion", "christian"]
+  },
+  "religion_hindu_v1": {
+    "name": "religion_hindu_v1",
+    "adapter_path": "models/adapters/religion_hindu_v1",
+    "base_model": "meta-llama/LLaMA-2-13b-hf",
+    "target_modules": ["q_proj", "v_proj"],
+    "r": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05,
+    "version": "0.1.0",
+    "hf_repo_id": "your-org/religion_hindu_v1",
+    "task": "npc_religion",
+    "audience": "teen",
+    "description": "Hindu lore/style adapter for sages/temple guardians/yogis.",
+    "tags": ["npc", "religion", "hindu"]
+  }
+}

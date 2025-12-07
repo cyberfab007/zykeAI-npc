@@ -16,6 +16,11 @@ RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "120"))
 RATE_LIMIT_WINDOW_SEC = float(os.getenv("RATE_LIMIT_WINDOW_SEC", "60"))
 METRICS_REQUIRE_AUTH = os.getenv("METRICS_REQUIRE_AUTH", "true").lower() == "true"
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "8"))
+ALLOW_CUSTOM_ADAPTER_PATH = os.getenv("ALLOW_CUSTOM_ADAPTER_PATH", "false").lower() == "true"
+DEFAULT_BASE_MODEL = os.getenv("DEFAULT_BASE_MODEL", "models/latest")
+DEFAULT_TOKENIZER_PATH = os.getenv("DEFAULT_TOKENIZER_PATH", "models/latest")
+DEFAULT_ADAPTER_NAME = os.getenv("DEFAULT_ADAPTER_NAME")
+DEFAULT_MANIFEST_PATH = os.getenv("DEFAULT_MANIFEST_PATH", "data/adapters/manifest.json")
 
 app = Flask(__name__)
 
@@ -153,9 +158,13 @@ def _handle_single_request(body: dict):
         raise ValueError(f"Missing fields: {', '.join(missing)}")
 
     audience = (body.get("audience") or "minor").lower()
-    base_model = body.get("base_model", "models/latest")
-    tokenizer_path = body.get("tokenizer_path", "models/latest")
+    base_model = body.get("base_model", DEFAULT_BASE_MODEL)
+    tokenizer_path = body.get("tokenizer_path", DEFAULT_TOKENIZER_PATH)
     adapter_path = body.get("adapter_path")  # optional
+    adapter_name = body.get("adapter_name") or DEFAULT_ADAPTER_NAME  # optional (manifest lookup)
+    manifest_path = body.get("manifest_path", DEFAULT_MANIFEST_PATH)
+    if adapter_path and not ALLOW_CUSTOM_ADAPTER_PATH:
+        raise ValueError("adapter_path not allowed; use adapter_name from manifest or enable ALLOW_CUSTOM_ADAPTER_PATH")
     max_new_tokens = int(body.get("max_new_tokens", 80))
     # Defaults: minors => safety on + schema enforced; adults => safety off + no retries/guards
     default_safe = False if audience == "adult" else True
@@ -175,11 +184,13 @@ def _handle_single_request(body: dict):
         return generate_npc_response(
             base_model=base_model,
             tokenizer_path=tokenizer_path,
-            adapter_path=adapter_path,
-            persona=body["persona"],
-            context=body["context"],
-            state=body["state"],
-            player_input=body["player_input"],
+        adapter_path=adapter_path,
+        adapter_name=adapter_name,
+        manifest_path=manifest_path,
+        persona=body["persona"],
+        context=body["context"],
+        state=body["state"],
+        player_input=body["player_input"],
             max_new_tokens=max_new_tokens,
             safe_mode=safe_mode,
             quantization=quantization,
