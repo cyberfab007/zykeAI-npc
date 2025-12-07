@@ -1,5 +1,5 @@
 import json
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -68,12 +68,7 @@ def build_npc_prompt(persona: str, context: str, state: str, player_input: str) 
 def parse_npc_output(raw_text: str) -> Dict[str, str]:
     start = raw_text.find("{")
     end = raw_text.rfind("}")
-    fallback = {
-        "say": raw_text.strip(),
-        "action": "idle",
-        "emotion": "neutral",
-        "thoughts": "",
-    }
+    fallback = {"say": raw_text.strip(), "action": "idle", "emotion": "neutral", "thoughts": ""}
     if start == -1 or end == -1 or end <= start:
         return fallback
     try:
@@ -86,12 +81,7 @@ def parse_npc_output(raw_text: str) -> Dict[str, str]:
             action = "idle"
         if emotion not in ALLOWED_EMOTIONS:
             emotion = "neutral"
-        return {
-            "say": say,
-            "action": action,
-            "emotion": emotion,
-            "thoughts": thoughts,
-        }
+        return {"say": say, "action": action, "emotion": emotion, "thoughts": thoughts}
     except Exception:
         return fallback
 
@@ -123,6 +113,27 @@ def _enforce_safety(text: str, safe_mode: bool) -> bool:
     return not any(bad in lower for bad in BAD_WORDS)
 
 
+def _validate_structured(payload: Dict[str, str]) -> Tuple[bool, Dict[str, str]]:
+    """Return (valid, normalized_payload)."""
+    say = str(payload.get("say", "")).strip()
+    action = payload.get("action", "idle")
+    emotion = payload.get("emotion", "neutral")
+    thoughts = str(payload.get("thoughts", "")).strip()
+    if action not in ALLOWED_ACTIONS:
+        action = "idle"
+    if emotion not in ALLOWED_EMOTIONS:
+        emotion = "neutral"
+    normalized = {"say": say[:500] if say else "", "action": action, "emotion": emotion, "thoughts": thoughts[:500]}
+    enum_violations = 0
+    if action not in ALLOWED_ACTIONS:
+        enum_violations += 1
+    if emotion not in ALLOWED_EMOTIONS:
+        enum_violations += 1
+    missing_required = int(not normalized["say"]) + int(not normalized["action"]) + int(not normalized["emotion"])
+    valid = bool(normalized["say"] and normalized["action"] and normalized["emotion"])
+    return valid, normalized, enum_violations, missing_required
+
+
 def generate_npc_response(
     base_model: str,
     tokenizer_path: str,
@@ -138,6 +149,11 @@ def generate_npc_response(
     top_p: float = 0.9,
     top_k: Optional[int] = None,
     num_beams: Optional[int] = None,
+    max_retries: int = 2,
+    return_stats: bool = False,
+    enforce_schema: bool = True,
+    use_flash_attn: bool = False,
+    compile_model: bool = False,
 ) -> Dict[str, str]:
     prompt = build_npc_prompt(persona, context, state, player_input)
     model, tokenizer, device = load_model_with_adapter(
@@ -145,28 +161,85 @@ def generate_npc_response(
         tokenizer_path=tokenizer_path,
         adapter_path=adapter_path,
         quantization=quantization,
+        use_flash_attn=use_flash_attn,
+        compile_model=compile_model,
     )
     inputs = tokenizer(
         prompt, return_tensors="pt", truncation=True, max_length=512
     ).to(device)
     bad_words_ids = _bad_words_ids(tokenizer, BAD_WORDS) if safe_mode else None
 
-    with torch.no_grad():
-        output = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=True if (num_beams is None or num_beams <= 1) else False,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            num_beams=num_beams or 1,
-            pad_token_id=tokenizer.eos_token_id,
-            bad_words_ids=bad_words_ids,
-        )
-    raw = tokenizer.decode(output[0], skip_special_tokens=True)
-    if not _enforce_safety(raw, safe_mode):
-        return REFUSAL.copy()
-    return parse_npc_output(raw)
+    # If schema enforcement is off (adult profile), return the first pass raw parse without retries.
+    if not enforce_schema:
+        with torch.no_grad():
+            output = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=True if (num_beams is None or num_beams <= 1) else False,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                num_beams=num_beams or 1,
+                pad_token_id=tokenizer.eos_token_id,
+                bad_words_ids=bad_words_ids,
+            )
+        raw = tokenizer.decode(output[0], skip_special_tokens=True)
+        parsed = parse_npc_output(raw)
+        return (parsed, {"final_outcome": "success", "npc_json_valid": True}) if return_stats else parsed
+
+    stats = {
+        "npc_json_valid": False,
+        "enum_violations": 0,
+        "missing_required_fields": 0,
+        "retry_count": 0,
+        "retry_reason": None,
+        "final_outcome": "refusal",
+        "safety_filter_triggered": False,
+        "initial_temperature": temperature,
+        "initial_top_p": top_p,
+        "final_temperature": None,
+        "final_top_p": None,
+    }
+
+    for attempt in range(max_retries + 1):
+        temp = max(0.2, temperature * (0.7**attempt))
+        top_p_cur = min(0.95, max(0.5, top_p - 0.1 * attempt))
+        with torch.no_grad():
+            output = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=True if (num_beams is None or num_beams <= 1) else False,
+                temperature=temp,
+                top_p=top_p_cur,
+                top_k=top_k,
+                num_beams=num_beams or 1,
+                pad_token_id=tokenizer.eos_token_id,
+                bad_words_ids=bad_words_ids,
+            )
+        raw = tokenizer.decode(output[0], skip_special_tokens=True)
+        if not _enforce_safety(raw, safe_mode):
+            stats["safety_filter_triggered"] = True
+            stats["retry_reason"] = "safety_filter"
+            continue
+        parsed = parse_npc_output(raw)
+        ok, normalized, enum_violations, missing_required = _validate_structured(parsed)
+        stats["enum_violations"] += enum_violations
+        stats["missing_required_fields"] += missing_required
+        if ok:
+            stats["npc_json_valid"] = True
+            stats["final_outcome"] = "success"
+            stats["retry_count"] = attempt
+            stats["final_temperature"] = temp
+            stats["final_top_p"] = top_p_cur
+            return (normalized, stats) if return_stats else normalized
+        stats["retry_reason"] = "json_parse_fail" if missing_required else "enum_violation"
+        stats["retry_count"] = attempt + 1
+
+    # Final fallback if we never produced valid structured output
+    stats["final_outcome"] = "refusal"
+    stats["final_temperature"] = max(0.2, temperature * (0.7**max_retries))
+    stats["final_top_p"] = min(0.95, max(0.5, top_p - 0.1 * max_retries))
+    return (REFUSAL.copy(), stats) if return_stats else REFUSAL.copy()
 
 
 if __name__ == "__main__":

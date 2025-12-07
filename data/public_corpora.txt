@@ -1,0 +1,36 @@
+Wikipedia (all languages) — dumps index
+  https://dumps.wikimedia.org/
+English Wikipedia dumps
+  https://dumps.wikimedia.org/enwiki/
+
+Wikidata — structured knowledge base dumps
+  Info: https://www.wikidata.org/wiki/Wikidata:Database_download
+  Dumps index: https://dumps.wikimedia.org/wikidatawiki/
+
+Project Gutenberg — public domain books
+  https://www.gutenberg.org/
+  Sample volume: https://www.gutenberg.org/ebooks/13600
+
+Standard Ebooks — cleaned public domain ebooks
+  https://standardebooks.org/
+
+1911 Encyclopaedia Britannica (public domain)
+  Wikisource: https://en.wikisource.org/wiki/1911_Encyclop%C3%A6dia_Britannica
+
+Catholic Encyclopedia (1913, public domain)
+  Wikisource: https://en.wikisource.org/wiki/Catholic_Encyclopedia_(1913)
+  Alternate index: https://onlinebooks.library.upenn.edu/webbin/metabook?id=cathency
+
+Internet Archive — public domain & scanned books
+  https://archive.org/  (filter Texts to “Public Domain” / pre-1928)
+
+OpenWebText2 — large filtered web text (Reddit-linked URLs)
+  Repo: https://github.com/EleutherAI/openwebtext2
+  HF mirror: https://huggingface.co/datasets/segyges/OpenWebText2
+
+OpenWebTextCorpus — original OpenWebText
+  Info/download: https://skylion007.github.io/OpenWebTextCorpus/
+  Alt impl: https://github.com/jcpeterson/openwebtext
+
+Wikimedia meta dump overview
+  https://meta.wikimedia.org/wiki/Data_dumps

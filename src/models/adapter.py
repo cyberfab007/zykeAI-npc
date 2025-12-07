@@ -26,10 +26,12 @@ def load_model_with_adapter(
     tokenizer_path: str,
     adapter_path: Optional[str] = None,
     quantization: Optional[str] = None,
+    use_flash_attn: bool = False,
+    compile_model: bool = False,
 ):
     """
     Load a GPT-2 model and tokenizer, optionally applying a PEFT adapter and quantization.
-    Results are cached by (base_model, adapter_path, quantization, tokenizer_path).
+    Results are cached by (base_model, adapter_path, quantization, tokenizer_path, use_flash_attn, compile_model).
     """
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -55,7 +57,30 @@ def load_model_with_adapter(
 
     model.resize_token_embeddings(len(tokenizer))
     model.config.pad_token_id = tokenizer.pad_token_id
+    # Flash attention requires CUDA + fp16/bf16; fall back quietly otherwise.
+    dtype = getattr(model, "dtype", None)
+    if use_flash_attn and not (
+        device.type == "cuda" and dtype in (torch.float16, torch.bfloat16)
+    ):
+        use_flash_attn = False
+
+    if use_flash_attn:
+        # Best-effort flash attention toggle (works for flash-compatible builds)
+        try:
+            if hasattr(model, "set_default_attn_implementation"):
+                model.set_default_attn_implementation("flash_attention_2")
+            elif hasattr(model, "config"):
+                model.config._attn_implementation = "flash_attention_2"
+        except Exception:
+            pass
+
     if not quant_cfg:
         model.to(device)
+
+    if compile_model and torch.cuda.is_available():
+        try:
+            model = torch.compile(model)  # type: ignore[attr-defined]
+        except Exception:
+            pass
     model.eval()
     return model, tokenizer, device

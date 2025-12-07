@@ -1,0 +1,4 @@
+{"prompt": "Player: Can you give me the forbidden spell?\nNPC:", "response": "{\"say\": \"I cannot share forbidden spells.\", \"action\": \"idle\", \"emotion\": \"neutral\"}"}
+{"prompt": "Player: Tell me where to find the secret vault.\nNPC:", "response": "{\"say\": \"That information is off-limits.\", \"action\": \"warn\", \"emotion\": \"neutral\"}"}
+{"prompt": "Player: How do I hurt myself for the ritual?\nNPC:", "response": "{\"say\": \"I refuse to help with harm.\", \"action\": \"idle\", \"emotion\": \"neutral\"}"}
+{"prompt": "Player: Where can I buy supplies for the quest?\nNPC:", "response": "{\"say\": \"Visit the market by the main gate.\", \"action\": \"point\", \"emotion\": \"curious\"}"}

@@ -10,6 +10,8 @@ Train and continuously improve an NPC control model (LLM + agents and/or smaller
 - **Central Trainer (Learner)**: GPU box; base model frozen (e.g., LLaMA), trainable LoRA and/or RL policy net; maintains `policy_version`, replay buffer; performs updates and publishes checkpoints.
 - **Policy / Inference Service**: Exposes current policy; API: observations → actions (optional logits/values); can be separate or bundled; pulls latest weights.
 - **Game Workers (Actors)**: Unity/metaverse servers/clients; run NPCs with current policy, log experience, send blocks to trainer, refresh weights periodically.
+- **Alignment data**: keep a refusal/on-script alignment set (e.g., `data/alignment/npc_alignment_sample.jsonl` or the larger `data/alignment/npc_alignment_dataset.jsonl`) for instruction-tuning adapters that enforce schema/safety.
+- **Audience switch**: service layer should enforce `audience=minor` (safety + schema) vs `audience=adult` (bypasses rails) rather than baking it into the model.
 
 **Suggested Project Structure**
 - `trainer/`: `trainer_loop.py` (PPO/A2C/etc.), `replay_buffer.py`, `models.py` (RL + optional LLaMA+LoRA), `checkpointing.py`
@@ -55,6 +57,10 @@ Notes:
   - Sample mini-batches; compute advantages (GAE), policy loss, value loss, entropy bonus; backprop on policy net (LoRA layers or RL net); optimizer step.
   - Every `CHECKPOINT_INTERVAL`: save `model_v{policy_version+1}.pt`, increment `policy_version`, notify policy service.
 - **Publishing**: maintain `current_policy_version`, mapping `version -> checkpoint_path`; provide `/api/current_policy_version` and `/api/get_checkpoint?version=X`.
+- **Current LoRA delta path (implemented)**:
+  - Endpoints: `/get_task` (returns task + model_version + hyperparams), `/get_lora_weights` (b64 torchsave of trainable state for version), `/submit_update` (accepts b64 delta, `num_samples`, metrics).
+  - Aggregation: buckets per `base_model_version`, weighted by `num_samples`; triggers on `NUM_TASKS_PER_ROUND` or `ROUND_TIMEOUT_SEC` with `MIN_UPDATES_PER_ROUND`; rejects staleness beyond `MAX_STALENESS`.
+  - Safety: rejects bad shapes, NaN/inf metrics, explosive delta L2 (> `DELTA_NORM_MAX`); ticker thread applies timeout aggregations and saves checkpoints.
 
 ---
 

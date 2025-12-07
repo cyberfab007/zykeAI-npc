@@ -19,11 +19,13 @@ This repository contains scripts to finetune modern open models (default: LLaMA 
 - `openweb/` — Open WebUI + Ollama compose.
 - `results/`, `models/`, `logs/` — training artifacts (gitignored).
 
-## Distributed Training Smoke Test (stub)
-- Start trainer service: `python -m trainer.server` (NUM_TASKS_PER_ROUND defaults to 3, checkpoint dir `models/checkpoints`).
-- Start one or more dummy workers: `python actors/worker.py --trainer-url http://localhost:5001 --num-tasks 3`.
-- Observe trainer logs: after 3 updates, policy_version increments and a new checkpoint is written; policy_service will pick up the latest weights.
-- Local base training: `python trainer/trainer_loop.py` can run standalone PPO on locally pulled experience blocks (polling endpoint placeholder in args) without distributed updates.
+## Distributed Training Smoke Test (LoRA delta path)
+- Start trainer service (runs aggregation + timeout ticker): `python -m trainer.server`
+  - Env knobs: `NUM_TASKS_PER_ROUND` (default 3), `MIN_UPDATES_PER_ROUND` (1), `ROUND_TIMEOUT_SEC` (30s), `MAX_STALENESS` (1), `DELTA_NORM_MAX` (1e9), `TICK_INTERVAL_SEC` (1s), `CHECKPOINT_DIR` (`models/checkpoints`).
+- Start one or more workers that compute real deltas: `python actors/worker.py --trainer-url http://localhost:5001 --num-tasks 3`
+  - Worker flow: GET `/get_task` → GET `/get_lora_weights` → local train loop → fp16 delta torchsave → POST `/submit_update` with metrics (`train_loss_mean/last`, `grad_norm_mean`, steps, duration, num_samples`).
+- Watch trainer logs: after `NUM_TASKS_PER_ROUND` updates (or timeout + `MIN_UPDATES_PER_ROUND`), aggregation runs, `policy_version` increments, and a new checkpoint is saved under `models/checkpoints`.
+- Local base training (no distributed updates): `python trainer/trainer_loop.py` can run standalone PPO on locally pulled experience blocks (polling endpoint placeholder in args).
 
 ## Quickstart
 
@@ -31,12 +33,15 @@ This repository contains scripts to finetune modern open models (default: LLaMA 
 2. Link to external storage (optional): `python data/link_external.py --external-root /mnt/SSD1TB/ZYKE_DATA` (links `data/raw`, `data/processed`, `models`, `results`, `logs` to your mount).
 3. Build a cleaned dataset (streaming, weighted): `python data/build_dataset.py --sources openwebtext,wikipedia --output-dir data/processed --max-total 100000 --weights openwebtext=1,wikipedia=1 --local-dir data/raw/ebooks --lang en --use-minhash --minhash-threshold 0.8` (adjust weights/sources/filters as needed).
 4. (Optional) Custom prep: `python data/prepare_data.py`
-5. Train: `python scripts/train.py --resume-latest` (default base `meta-llama/Llama-2-13b-hf`, data `data/raw/wikipedia-en-0.json`, checkpoints `models/checkpoints`, final weights `models/latest`). LoRA adapter: add `--use-lora --adapter-name <name>` (saved under `models/adapters/<name>`), set targets via `--lora-target-modules`. Logging: `--log-to tensorboard|wandb` (set `WANDB_PROJECT`/token); push to Hub: `--hf-push`. Note: LLaMA weights require HF access/token.
-6. Evaluate: `python scripts/evaluate.py --evals wikitext2,wikitext103,c4,lambada,piqa,hellaswag,winogrande,arc` (perplexity/accuracy + regression prompts). Test an adapter: `--adapter-path models/adapters/<name> --base-model meta-llama/Llama-2-13b-hf`.
-7. Adapter use at inference: call `generate_npc_response(..., adapter_path="models/adapters/<name>", base_model="meta-llama/Llama-2-13b-hf")` or in CLI eval use `--adapter-path models/adapters/<name> --base-model meta-llama/Llama-2-13b-hf`. Keep the base model consistent with the adapter’s training base.
-8. NPC schema inference: `python -m src.inference.generator` for persona/context → JSON. Safe-mode on by default; set `safe_mode=False` for raw output. Optional quantization: `quantization="4bit"` or `"8bit"` to lower VRAM/latency.
-9. Prepare NPC schema dataset: `python data/prepare_npc_schema.py --input data/npc_sample.jsonl --output-dir data/processed` (validate/dedup/split schema JSONL into train/val for adapter finetuning).
-10. Deployment API: `API_TOKEN=yourtoken python deployment/app.py` (Flask). Endpoints: `/health`, `/metrics`, `/generate` (POST JSON with persona/context/state/player_input, optional adapter_path/base_model, max_new_tokens, temperature, top_p, top_k, num_beams, safe_mode, quantization).
+5. (Optional) Build experience blocks for the distributed trainer: `python data/make_experience_blocks.py --input-path data/processed --output data/processed/experience_blocks.jsonl --tokenizer meta-llama/Llama-2-13b-hf --seq-len 128 --steps-per-block 64 --env-id ebooks --npc-type generic`.
+6. (Optional) Smoke-test with tiny starter blocks: `python scripts/train.py --data_dir data/starter_blocks --resume-latest --max_steps 50` (uses curated JSONL in `data/starter_blocks` for quick QA).
+7. Train: `python scripts/train.py --resume-latest` (default base `meta-llama/Llama-2-13b-hf`, data `data/raw/wikipedia-en-0.json`, checkpoints `models/checkpoints`, final weights `models/latest`). LoRA adapter: add `--use-lora --adapter-name <name>` (saved under `models/adapters/<name>`), set targets via `--lora-target-modules`. Logging: `--log-to tensorboard|wandb` (set `WANDB_PROJECT`/token); push to Hub: `--hf-push`. Note: LLaMA weights require HF access/token.
+8. Evaluate: `python scripts/evaluate.py --evals wikitext2,wikitext103,c4,lambada,piqa,hellaswag,winogrande,arc` (perplexity/accuracy + regression prompts). Test an adapter: `--adapter-path models/adapters/<name> --base-model meta-llama/Llama-2-13b-hf`.
+8. Adapter use at inference: call `generate_npc_response(..., adapter_path="models/adapters/<name>", base_model="meta-llama/Llama-2-13b-hf")` or in CLI eval use `--adapter-path models/adapters/<name> --base-model meta-llama/Llama-2-13b-hf`. Keep the base model consistent with the adapter’s training base.
+9. NPC schema inference: `python -m src.inference.generator` for persona/context → JSON. Safe-mode on by default; set `safe_mode=False` for raw output. Optional quantization: `quantization="4bit"` or `"8bit"` to lower VRAM/latency.
+10. Prepare NPC schema dataset: `python data/prepare_npc_schema.py --input data/npc_sample.jsonl --output-dir data/processed` (validate/dedup/split schema JSONL into train/val for adapter finetuning).
+11. Deployment API: `API_TOKEN=yourtoken python deployment/app.py` (Flask). Endpoints: `/health`, `/metrics`, `/generate` (POST JSON with persona/context/state/player_input, optional adapter_path/base_model, max_new_tokens, temperature, top_p, top_k, num_beams, safe_mode, quantization).
+12. Distributed delta loop: run `python -m trainer.server` (trainer) and `python actors/worker.py --trainer-url http://localhost:5001` (workers) to aggregate LoRA deltas into checkpoints; tune env vars listed above for round size/timeout/safety.
 
 Set `PYTHONPATH=.` if you import from `src/` in your own scripts.
 
@@ -48,3 +53,6 @@ Set `PYTHONPATH=.` if you import from `src/` in your own scripts.
 - Logging/monitoring: `--log-to tensorboard` (logs under `logs/training`) or `--log-to wandb` (requires `WANDB_PROJECT`/token). Hub publish with `--hf-push`.
 - Adapter instructions: train with `--use-lora`, choose a name via `--adapter-name`, and configure targets via `--lora-target-modules`. Load at eval (`--adapter-path models/adapters/<name> --base-model meta-llama/Llama-2-13b-hf`) or inference (`generate_npc_response(..., adapter_path=...)`). Keep the base model consistent with what the adapter was trained on.
 - Inference options: safe-mode filtering for NPC JSON outputs (toggleable), optional 4/8-bit quantization for lower latency/VRAM, and adapter loading for modular skills. API supports generation params (temperature/top_p/top_k/num_beams) and auth via `API_TOKEN`.
+- Distributed delta safety: trainer rejects stale versions, bad shapes, NaN/inf metrics, and deltas above `DELTA_NORM_MAX`; ticker thread enforces `ROUND_TIMEOUT_SEC` aggregation.
+- Alignment/safety: generator now retries JSON parsing with temperature/top-p backoff and enforces allowed enums; audience flag controls rails (`audience=minor` default keeps safety/schema; `audience=adult` bypasses them). Sample refusal/alignment pairs under `data/alignment/npc_alignment_sample.jsonl` and larger `data/alignment/npc_alignment_dataset.jsonl` to seed instruction-tuning.
+- Inference efficiency & ops: optional flash-attention (`use_flash_attn`), torch.compile (`compile_model`), quantization (4/8-bit), and simple request batching (`requests: [ ... ]`) in `/generate` (batch-level flags apply to the whole batch). Model/tokenizer caching remains per-process via LRU; Prometheus metrics at `/metrics`, rate limiting, timeouts, and stricter auth default (`REQUIRE_API_TOKEN=true`).

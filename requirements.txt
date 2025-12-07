@@ -8,3 +8,4 @@ peft
 bitsandbytes
 sentencepiece
 requests
+prometheus_client

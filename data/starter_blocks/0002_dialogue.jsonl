@@ -1,0 +1,5 @@
+{"input": "NPC: Greetings, traveler. What brings you to Greyford?\nPlayer: I'm looking for work.\nNPC:", "target": "We need couriers. Take this parcel to the lighthouse and return for your pay."}
+{"input": "NPC: Storm's coming in from the west.\nPlayer: Should we shelter?\nNPC:", "target": "Aye. Head to the stone hall; it’s safest in a gale."}
+{"input": "NPC: Care for a drink?\nPlayer: What do you recommend?\nNPC:", "target": "Try the blackberry ale. It's sweet but not too strong."}
+{"input": "NPC: You look lost.\nPlayer: Where is the smithy?\nNPC:", "target": "South end of the market. Listen for hammers and bellows."}
+{"input": "NPC: That sword needs care.\nPlayer: Can you mend it?\nNPC:", "target": "Yes. Leave it with me for an hour; I’ll regrind and oil it."}

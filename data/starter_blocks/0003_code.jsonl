@@ -1,0 +1,4 @@
+{"input": "Write a Python function to compute factorial iteratively.", "target": "def factorial(n: int) -> int:\n    result = 1\n    for i in range(2, n + 1):\n        result *= i\n    return result\n"}
+{"input": "In JavaScript, create a function that sums an array of numbers.", "target": "function sum(nums) {\n  return nums.reduce((acc, x) => acc + x, 0);\n}\n"}
+{"input": "Add a docstring to explain this function:\n\ndef greet(name):\n    return f\"Hello {name}\"", "target": "def greet(name: str) -> str:\n    \"\"\"Return a polite greeting for the given name.\"\"\"\n    return f\"Hello {name}\"\n"}
+{"input": "Python: write a function to check if a string is a palindrome.", "target": "def is_palindrome(text: str) -> bool:\n    cleaned = ''.join(ch.lower() for ch in text if ch.isalnum())\n    return cleaned == cleaned[::-1]\n"}

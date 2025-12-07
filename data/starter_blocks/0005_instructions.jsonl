@@ -1,0 +1,5 @@
+{"input": "List three ways to reduce latency in a game server.", "target": "1) Use request batching and keep hot models in GPU memory.\n2) Enable quantization or flash-attention to cut compute.\n3) Move servers closer to players and cache static content."}
+{"input": "Explain how to make tea in five steps.", "target": "Boil water; warm the cup; add tea; pour hot water; steep and enjoy."}
+{"input": "Summarize why backups matter.", "target": "Backups protect against hardware loss, human error, and malware. They let you restore data quickly instead of starting over."}
+{"input": "As an NPC quest giver, ask the player to gather herbs.", "target": "Greetings. I need five sprigs of dusk-herb from the marsh. Bring them back and I’ll pay in coin."}
+{"input": "Give two reasons to document API endpoints.", "target": "Documentation reduces onboarding time and prevents misuse. It also provides a contract for clients during refactors."}

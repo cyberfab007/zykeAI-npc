@@ -55,6 +55,7 @@ Notes:
   - Sample mini-batches; compute advantages (GAE), policy loss, value loss, entropy bonus; backprop on policy net (LoRA layers or RL net); optimizer step.
   - Every `CHECKPOINT_INTERVAL`: save `model_v{policy_version+1}.pt`, increment `policy_version`, notify policy service.
 - **Publishing:** maintain `current_policy_version`; mapping `version -> checkpoint_path`; provide `/api/current_policy_version` and `/api/get_checkpoint?version=X`.
+- **Implemented LoRA delta path:** `/get_task` + `/get_lora_weights` let workers pull tasks/weights; `/submit_update` accepts fp16 deltas + metrics and aggregates per-version with staleness checks, delta L2 guard, and timeout-based rounds (envs: `NUM_TASKS_PER_ROUND`, `MIN_UPDATES_PER_ROUND`, `ROUND_TIMEOUT_SEC`, `MAX_STALENESS`, `DELTA_NORM_MAX`).
 
 ## Policy Service
 - Loads latest weights; provides low-latency `get_action` and `current_policy_version`.
