@@ -34,6 +34,7 @@ Set `PYTHONPATH=.` if you import from `src/` in your own scripts.
 
 ## Notes
 
+- License: CC BY-NC 4.0 (non-commercial use only). See `LICENSE`.
 - Large datasets, checkpoints, and logs are gitignored; use external storage for big artifacts.
 - Deployment example is a simple Flask script; adapt to FastAPI or your stack as needed.
 - Logging/monitoring: `--log-to tensorboard` (logs under `logs/training`) or `--log-to wandb` (requires `WANDB_PROJECT`/token). Hub publish with `--hf-push`.
