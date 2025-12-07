@@ -19,6 +19,11 @@ This repository contains scripts to finetune modern open models (default: LLaMA 
 - `openweb/` — Open WebUI + Ollama compose.
 - `results/`, `models/`, `logs/` — training artifacts (gitignored).
 
+## Distributed Training Smoke Test (stub)
+- Start trainer service: `python -m trainer.server` (NUM_TASKS_PER_ROUND defaults to 3, checkpoint dir `models/checkpoints`).
+- Start one or more dummy workers: `python actors/worker.py --trainer-url http://localhost:5001 --num-tasks 3`.
+- Observe trainer logs: after 3 updates, policy_version increments and a new checkpoint is written; policy_service will pick up the latest weights.
+
 ## Quickstart
 
 1. Install deps (prefer Python 3.12): `pip install -r requirements.txt`

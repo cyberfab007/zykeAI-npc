@@ -8,6 +8,7 @@ training:
   min_buffer: 5000
   batch_size: 256
   num_epochs: 1
+  num_tasks_per_round: 3
   lr: 3e-4
   weight_decay: 0.01
   gamma: 0.99
