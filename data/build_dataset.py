@@ -13,6 +13,17 @@ from typing import Dict, Iterable, Iterator, List, Optional
 
 from datasets import load_dataset, IterableDataset
 
+try:
+    from langdetect import detect
+except ImportError:
+    detect = None
+
+try:
+    from datasketch import MinHash, MinHashLSH
+except ImportError:
+    MinHash = None
+    MinHashLSH = None
+
 
 DEFAULT_PROFANITY = {
     "fuck",
@@ -62,20 +73,37 @@ def passes_filters(
     text: str,
     min_tokens: int,
     max_tokens: int,
+    min_chars: int,
+    max_chars: int,
     profanity: set[str],
+    lang: Optional[str],
 ) -> bool:
     tokens = text.strip().split()
     if not (min_tokens <= len(tokens) <= max_tokens):
+        return False
+    if min_chars and len(text) < min_chars:
+        return False
+    if max_chars and len(text) > max_chars:
         return False
     lower = text.lower()
     if any(word in lower for word in profanity):
         return False
     if EMAIL_RE.search(text) or PHONE_RE.search(text):
         return False
+    if lang and detect:
+        try:
+            detected = detect(text)
+            if detected != lang:
+                return False
+        except Exception:
+            return False
+    elif lang and not detect:
+        # lang filter requested but langdetect missing
+        return False
     return True
 
 
-def deduped(samples: Iterable[str], max_items: int) -> Iterator[str]:
+def deduped_exact(samples: Iterable[str], max_items: int) -> Iterator[str]:
     seen = set()
     for text in samples:
         h = hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
@@ -84,6 +112,24 @@ def deduped(samples: Iterable[str], max_items: int) -> Iterator[str]:
         seen.add(h)
         yield text
         if 0 < max_items <= len(seen):
+            break
+
+
+def deduped_minhash(samples: Iterable[str], max_items: int, threshold: float, num_perm: int) -> Iterator[str]:
+    if MinHash is None or MinHashLSH is None:
+        raise ImportError("datasketch is required for MinHash dedup; install with `pip install datasketch`.")
+    lsh = MinHashLSH(threshold=threshold, num_perm=num_perm)
+    count = 0
+    for text in samples:
+        mh = MinHash(num_perm=num_perm)
+        for token in text.split():
+            mh.update(token.encode("utf-8"))
+        if lsh.query(mh):
+            continue
+        lsh.insert(f"id_{count}", mh)
+        yield text
+        count += 1
+        if 0 < max_items <= count:
             break
 
 
@@ -142,6 +188,18 @@ def parse_args():
         help="Maximum token count to keep a sample.",
     )
     parser.add_argument(
+        "--min-chars",
+        type=int,
+        default=0,
+        help="Minimum character count to keep a sample.",
+    )
+    parser.add_argument(
+        "--max-chars",
+        type=int,
+        default=0,
+        help="Maximum character count to keep a sample (0 to disable).",
+    )
+    parser.add_argument(
         "--train-ratio", type=float, default=0.98, help="Train split ratio."
     )
     parser.add_argument(
@@ -167,6 +225,28 @@ def parse_args():
         nargs="*",
         default=None,
         help="Optional override list of profanity words to filter.",
+    )
+    parser.add_argument(
+        "--lang",
+        default=None,
+        help="Optional language code to keep (e.g., en). Requires langdetect.",
+    )
+    parser.add_argument(
+        "--use-minhash",
+        action="store_true",
+        help="Enable MinHash near-duplicate filtering (requires datasketch).",
+    )
+    parser.add_argument(
+        "--minhash-threshold",
+        type=float,
+        default=0.8,
+        help="Jaccard similarity threshold for near-duplicate removal (0-1).",
+    )
+    parser.add_argument(
+        "--minhash-perm",
+        type=int,
+        default=64,
+        help="Number of permutations for MinHash.",
     )
     return parser.parse_args()
 
@@ -219,10 +299,22 @@ def main():
         filtered = (
             text
             for text in stream_fn()
-            if passes_filters(text, args.min_tokens, args.max_tokens, profanity)
+            if passes_filters(
+                text,
+                args.min_tokens,
+                args.max_tokens,
+                args.min_chars,
+                args.max_chars,
+                profanity,
+                args.lang,
+            )
         )
         target = per_source_target.get(source, args.max_per_source)
-        for text in deduped(filtered, target):
+        if args.use_minhash:
+            iterator = deduped_minhash(filtered, target, args.minhash_threshold, args.minhash_perm)
+        else:
+            iterator = deduped_exact(filtered, target)
+        for text in iterator:
             collected.append(text)
         print(f"Collected {len(collected)} total samples after {source}")
 

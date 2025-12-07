@@ -5,13 +5,16 @@ This project builds a cleaned language modeling corpus using public datasets str
 ## Sources
 - OpenWebText (`openwebtext`)
 - English Wikipedia (`wikipedia`, snapshot `20220301.en`)
+- Optional local text (`--local-dir`, labeled as `local`)
 
 ## Processing
 - Streaming ingestion to avoid full downloads.
 - Length filter: keep samples with token counts between configurable `min_tokens` and `max_tokens` (default 5–256, whitespace tokens).
+- Character filter: keep samples within `min_chars`/`max_chars` if set.
+- Language filter: optional `--lang` (requires langdetect) to keep only a target language.
 - Profanity filter: simple word-list exclusion (see `data/build_dataset.py`).
 - PII filter: drop samples containing email-like or phone-like patterns.
-- Deduplication: SHA-1 hash over sample text.
+- Deduplication: SHA-1 hash over sample text; optional MinHash near-duplicate removal (`--use-minhash`, requires datasketch).
 - Weights/mixing: `--max-total` and `--weights source=weight,...` to control per-source share; optional `--local-dir` to include local text as `local` source.
 - Splits: configurable train/val/test ratios (default 98/1/1), written to `data/processed/train.txt`, `val.txt`, `test.txt`.
 
@@ -23,6 +26,8 @@ python data/build_dataset.py \
   --weights openwebtext=1,wikipedia=1,local=3 \
   --local-dir data/raw/ebooks \
   --min-tokens 5 --max-tokens 256 \
+  --lang en \
+  --use-minhash --minhash-threshold 0.8 --minhash-perm 64 \
   --output-dir data/processed
 ```
 

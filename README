@@ -22,13 +22,14 @@ This repository contains scripts to finetune GPT-2–class models with Hugging F
 
 1. Install deps (prefer Python 3.12): `pip install -r requirements.txt`
 2. Link to external storage (optional): `python data/link_external.py --external-root /mnt/SSD1TB/ZYKE_DATA` (links `data/raw`, `data/processed`, `models`, `results`, `logs` to your mount).
-3. Build a cleaned dataset (streaming, weighted): `python data/build_dataset.py --sources openwebtext,wikipedia --output-dir data/processed --max-total 100000 --weights openwebtext=1,wikipedia=1 --local-dir data/raw/ebooks` (adjust weights/sources as needed).
+3. Build a cleaned dataset (streaming, weighted): `python data/build_dataset.py --sources openwebtext,wikipedia --output-dir data/processed --max-total 100000 --weights openwebtext=1,wikipedia=1 --local-dir data/raw/ebooks --lang en --use-minhash --minhash-threshold 0.8` (adjust weights/sources/filters as needed).
 4. (Optional) Custom prep: `python data/prepare_data.py`
 5. Train: `python scripts/train.py --resume-latest` (default base `meta-llama/Llama-2-13b-hf`, data `data/raw/wikipedia-en-0.json`, checkpoints `models/checkpoints`, final weights `models/latest`). LoRA adapter: add `--use-lora --adapter-name <name>` (saved under `models/adapters/<name>`), set targets via `--lora-target-modules`. Logging: `--log-to tensorboard|wandb` (set `WANDB_PROJECT`/token); push to Hub: `--hf-push`. Note: LLaMA weights require HF access/token.
 6. Evaluate: `python scripts/evaluate.py --evals wikitext2,wikitext103,c4,lambada,piqa` (perplexity/accuracy + regression prompts). Test an adapter: `--adapter-path models/adapters/<name> --base-model gpt2`.
 7. Adapter use at inference: call `generate_npc_response(..., adapter_path="models/adapters/<name>", base_model="meta-llama/Llama-2-13b-hf")` or in CLI eval use `--adapter-path models/adapters/<name> --base-model meta-llama/Llama-2-13b-hf`. Keep the base model consistent with the adapter’s training base.
 8. NPC schema inference: `python -m src.inference.generator` for persona/context → JSON. Safe-mode on by default; set `safe_mode=False` for raw output. Optional quantization: `quantization="4bit"` or `"8bit"` to lower VRAM/latency.
-9. Deployment API: `API_TOKEN=yourtoken python deployment/app.py` (Flask). Endpoints: `/health`, `/metrics`, `/generate` (POST JSON with persona/context/state/player_input, optional adapter_path/base_model, max_new_tokens, temperature, top_p, top_k, num_beams, safe_mode, quantization).
+9. Prepare NPC schema dataset: `python data/prepare_npc_schema.py --input data/npc_sample.jsonl --output-dir data/processed` (validate/dedup/split schema JSONL into train/val for adapter finetuning).
+10. Deployment API: `API_TOKEN=yourtoken python deployment/app.py` (Flask). Endpoints: `/health`, `/metrics`, `/generate` (POST JSON with persona/context/state/player_input, optional adapter_path/base_model, max_new_tokens, temperature, top_p, top_k, num_beams, safe_mode, quantization).
 
 Set `PYTHONPATH=.` if you import from `src/` in your own scripts.
 
