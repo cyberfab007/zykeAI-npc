@@ -14,6 +14,8 @@ REQUIRE_API_TOKEN = os.getenv("REQUIRE_API_TOKEN", "true").lower() == "true"
 REQUEST_TIMEOUT_SEC = float(os.getenv("REQUEST_TIMEOUT_SEC", "30"))
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "120"))
 RATE_LIMIT_WINDOW_SEC = float(os.getenv("RATE_LIMIT_WINDOW_SEC", "60"))
+METRICS_REQUIRE_AUTH = os.getenv("METRICS_REQUIRE_AUTH", "true").lower() == "true"
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "8"))
 
 app = Flask(__name__)
 
@@ -23,6 +25,8 @@ latency_hist = Histogram("api_latency_seconds", "API latency in seconds", ["endp
 rate_lock = Lock()
 rate_buckets = {}
 executor = ThreadPoolExecutor(max_workers=8)
+concurrency_lock = Lock()
+concurrency_count = 0
 
 
 def require_auth(fn):
@@ -46,6 +50,12 @@ def health():
 
 @app.route("/metrics", methods=["GET"])
 def get_metrics():
+    if METRICS_REQUIRE_AUTH:
+        if not API_TOKEN:
+            return jsonify({"error": "unauthorized: API token not configured"}), 401
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header != f"Bearer {API_TOKEN}":
+            return jsonify({"error": "unauthorized"}), 401
     return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
 
 
@@ -58,6 +68,9 @@ def generate():
     if not _check_rate_limit(rate_key):
         requests_counter.labels(endpoint=endpoint, status="rate_limited").inc()
         return jsonify({"error": "rate_limited"}), 429
+    if not _acquire_concurrency():
+        requests_counter.labels(endpoint=endpoint, status="concurrency_limited").inc()
+        return jsonify({"error": "concurrency_limited"}), 429
 
     payload = request.get_json(force=True, silent=True) or {}
 
@@ -107,12 +120,14 @@ def generate():
         )
         latency_hist.labels(endpoint=endpoint, status="success").observe(elapsed)
         requests_counter.labels(endpoint=endpoint, status="success").inc()
+        _release_concurrency()
         return jsonify({"results": results}), 200
     else:
         try:
             result = _handle_single_request(payload)
         except Exception as exc:
             requests_counter.labels(endpoint=endpoint, status="error").inc()
+            _release_concurrency()
             return jsonify({"error": str(exc)}), 500
         elapsed = time.time() - start_total
         app.logger.info(
@@ -127,6 +142,7 @@ def generate():
         )
         latency_hist.labels(endpoint=endpoint, status="success").observe(elapsed)
         requests_counter.labels(endpoint=endpoint, status="success").inc()
+        _release_concurrency()
         return jsonify(result), 200
 
 
@@ -199,6 +215,21 @@ def _check_rate_limit(key: str) -> bool:
         bucket.append(now)
         rate_buckets[key] = bucket
         return True
+
+
+def _acquire_concurrency() -> bool:
+    global concurrency_count
+    with concurrency_lock:
+        if concurrency_count >= MAX_CONCURRENCY:
+            return False
+        concurrency_count += 1
+        return True
+
+
+def _release_concurrency() -> None:
+    global concurrency_count
+    with concurrency_lock:
+        concurrency_count = max(0, concurrency_count - 1)
 
 
 if __name__ == "__main__":
