@@ -1,6 +1,6 @@
 # GPT Training Project
 
-This repository contains scripts to finetune GPT-2–class models with Hugging Face Transformers and deploy them behind simple services.
+This repository contains scripts to finetune modern open models (default: LLaMA 13B with LoRA options) using Hugging Face Transformers and deploy them behind simple services.
 
 ## Project Structure
 
