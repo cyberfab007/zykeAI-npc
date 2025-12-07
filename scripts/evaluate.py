@@ -1,5 +1,9 @@
+import argparse
 import math
+from pathlib import Path
+from typing import Iterable, List
 
+import torch
 from datasets import load_dataset
 from transformers import (
     GPT2LMHeadModel,
@@ -10,15 +14,73 @@ from transformers import (
 )
 
 
-def evaluate(model_path, tokenizer_path):
-    tokenizer = GPT2Tokenizer.from_pretrained(tokenizer_path)
-    tokenizer.pad_token = tokenizer.eos_token
+REGRESSION_PROMPTS = [
+    {
+        "name": "greeting",
+        "prompt": "NPC: Greetings, traveler. What brings you to our town?\nYou:",
+        "max_new_tokens": 40,
+    },
+    {
+        "name": "quest",
+        "prompt": "Blacksmith: I can forge you a blade, but I need rare ore from the caverns.\nYou:",
+        "max_new_tokens": 48,
+    },
+    {
+        "name": "lore",
+        "prompt": "Sage: Long ago, dragons ruled these skies. Tell me what you know of them.\nYou:",
+        "max_new_tokens": 48,
+    },
+]
 
-    model = GPT2LMHeadModel.from_pretrained(model_path)
-    model.resize_token_embeddings(len(tokenizer))
-    model.config.pad_token_id = tokenizer.pad_token_id
 
-    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="validation")
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate a GPT-2 checkpoint.")
+    parser.add_argument(
+        "--model-path",
+        default="models/latest",
+        help="Path to model weights.",
+    )
+    parser.add_argument(
+        "--tokenizer-path",
+        default="models/latest",
+        help="Path to tokenizer files.",
+    )
+    parser.add_argument(
+        "--adapter-path",
+        default=None,
+        help="Optional path to a LoRA adapter (if using PEFT).",
+    )
+    parser.add_argument(
+        "--base-model",
+        default="gpt2",
+        help="Base model name/path to load when applying an adapter.",
+    )
+    parser.add_argument(
+        "--evals",
+        default="wikitext2,wikitext103,c4,lambada,piqa",
+        help="Comma-separated evaluations to run: wikitext2,wikitext103,c4,lambada,piqa",
+    )
+    parser.add_argument(
+        "--piqa-samples",
+        type=int,
+        default=200,
+        help="Number of PIQA validation examples to score.",
+    )
+    parser.add_argument(
+        "--c4-split",
+        default="validation[:0.1%]",
+        help="C4 split for perplexity (use a small slice).",
+    )
+    parser.add_argument(
+        "--lambada-split",
+        default="validation",
+        help="LAMBADA split to use for perplexity.",
+    )
+    return parser.parse_args()
+
+
+def compute_perplexity(model, tokenizer, dataset_name: str, config: str, split: str) -> float:
+    dataset = load_dataset(dataset_name, config, split=split)
 
     def tokenize_function(examples):
         return tokenizer(
@@ -48,10 +110,148 @@ def evaluate(model_path, tokenizer_path):
 
     metrics = trainer.evaluate()
     eval_loss = metrics.get("eval_loss")
-    ppl = math.exp(eval_loss) if eval_loss is not None else float("nan")
-    print(f"Validation loss: {eval_loss:.4f}")
-    print(f"Validation perplexity: {ppl:.2f}")
+    return math.exp(eval_loss) if eval_loss is not None else float("nan")
+
+
+def run_regression_prompts(model, tokenizer, device):
+    model.eval()
+    for item in REGRESSION_PROMPTS:
+        inputs = tokenizer(
+            item["prompt"], return_tensors="pt", truncation=True, max_length=256
+        ).to(device)
+        with torch.no_grad():
+            output = model.generate(
+                **inputs,
+                max_new_tokens=item["max_new_tokens"],
+                do_sample=True,
+                temperature=0.8,
+                top_p=0.9,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+        text = tokenizer.decode(output[0], skip_special_tokens=True)
+        print(f"[{item['name']}] {text}\n")
+
+
+def score_option_logprob(model, tokenizer, prompt: str, option: str, device) -> float:
+    prompt_ids = tokenizer(prompt, return_tensors="pt").to(device)
+    option_ids = tokenizer(
+        option, return_tensors="pt", add_special_tokens=False
+    ).to(device)
+    input_ids = torch.cat([prompt_ids.input_ids, option_ids.input_ids], dim=1)
+    attention_mask = torch.cat(
+        [prompt_ids.attention_mask, option_ids.attention_mask], dim=1
+    )
+    with torch.no_grad():
+        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+    log_probs = torch.log_softmax(logits[:, :-1, :], dim=-1)
+    option_start = prompt_ids.input_ids.size(1)
+    option_token_ids = input_ids[:, option_start:]
+    option_log_probs = log_probs[:, option_start - 1 : -1, :].gather(
+        2, option_token_ids.unsqueeze(-1)
+    ).squeeze(-1)
+    return option_log_probs.sum().item()
+
+
+def compute_piqa_accuracy(model, tokenizer, device, samples: int) -> float:
+    ds = load_dataset("piqa", split=f"validation[:{samples}]")
+    correct = 0
+    total = 0
+    for sample in ds:
+        prompt = sample["goal"]
+        opt1 = sample["sol1"]
+        opt2 = sample["sol2"]
+        score1 = score_option_logprob(model, tokenizer, prompt, opt1, device)
+        score2 = score_option_logprob(model, tokenizer, prompt, opt2, device)
+        pred = 0 if score1 >= score2 else 1
+        if pred == sample["label"]:
+            correct += 1
+        total += 1
+    return correct / total if total else float("nan")
+
+
+def run_regression_prompts(model, tokenizer, device):
+    model.eval()
+    for item in REGRESSION_PROMPTS:
+        inputs = tokenizer(
+            item["prompt"], return_tensors="pt", truncation=True, max_length=256
+        ).to(device)
+        with torch.no_grad():
+            output = model.generate(
+                **inputs,
+                max_new_tokens=item["max_new_tokens"],
+                do_sample=True,
+                temperature=0.8,
+                top_p=0.9,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+        text = tokenizer.decode(output[0], skip_special_tokens=True)
+        print(f"[{item['name']}] {text}\n")
+
+
+def main():
+    args = parse_args()
+
+    tokenizer = GPT2Tokenizer.from_pretrained(args.tokenizer_path)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    if args.adapter_path:
+        try:
+            from peft import PeftModel
+        except ImportError as exc:
+            raise ImportError("peft is required to load adapters") from exc
+        base_model = GPT2LMHeadModel.from_pretrained(args.base_model)
+        model = PeftModel.from_pretrained(base_model, args.adapter_path)
+    else:
+        model = GPT2LMHeadModel.from_pretrained(args.model_path)
+
+    model.resize_token_embeddings(len(tokenizer))
+    model.config.pad_token_id = tokenizer.pad_token_id
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    evals = {e.strip() for e in args.evals.split(",") if e.strip()}
+    if "wikitext2" in evals:
+        try:
+            ppl = compute_perplexity(
+                model, tokenizer, "wikitext", "wikitext-2-raw-v1", "validation"
+            )
+            print(f"Perplexity (wikitext-2-raw-v1 validation): {ppl:.2f}")
+        except Exception as exc:  # pragma: no cover - diagnostic
+            print(f"Wikitext-2 perplexity failed: {exc}")
+    if "wikitext103" in evals:
+        try:
+            ppl = compute_perplexity(
+                model, tokenizer, "wikitext", "wikitext-103-raw-v1", "test"
+            )
+            print(f"Perplexity (wikitext-103-raw-v1 test): {ppl:.2f}")
+        except Exception as exc:  # pragma: no cover - diagnostic
+            print(f"Wikitext-103 perplexity failed: {exc}")
+    if "c4" in evals:
+        try:
+            ppl = compute_perplexity(
+                model, tokenizer, "c4", "en", args.c4_split
+            )
+            print(f"Perplexity (C4 {args.c4_split}): {ppl:.2f}")
+        except Exception as exc:  # pragma: no cover - diagnostic
+            print(f"C4 perplexity failed: {exc}")
+    if "lambada" in evals:
+        try:
+            ppl = compute_perplexity(
+                model, tokenizer, "lambada", "plain_text", args.lambada_split
+            )
+            print(f"Perplexity (LAMBADA {args.lambada_split}): {ppl:.2f}")
+        except Exception as exc:  # pragma: no cover - diagnostic
+            print(f"LAMBADA perplexity failed: {exc}")
+    if "piqa" in evals:
+        try:
+            acc = compute_piqa_accuracy(model, tokenizer, device, args.piqa_samples)
+            print(f"PIQA accuracy (first {args.piqa_samples} val): {acc:.3f}")
+        except Exception as exc:  # pragma: no cover - diagnostic
+            print(f"PIQA evaluation failed: {exc}")
+
+    print("Regression prompt generations:")
+    run_regression_prompts(model, tokenizer, device)
 
 
 if __name__ == "__main__":
-    evaluate("./results", "./results")
+    main()

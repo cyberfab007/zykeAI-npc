@@ -11,13 +11,18 @@ __pycache__/
 
 # Data artifacts (keep scripts, ignore payloads)
 data/raw/
+data/raw
 data/processed/
+data/processed
 data/lib/wikipedia-downloader/output/
 
 # Training outputs
 results/
+results
 models/
+models
 logs/
+logs
 *.ckpt
 
 # Docker/volumes

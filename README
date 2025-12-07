@@ -13,18 +13,22 @@ This repository contains scripts to finetune GPT-2–class models with Hugging F
   - `cc/` (command-and-control server)
   - `node/` (worker client)
   - `utils/` (config helpers)
-- `deployment/` — Dockerfile and app server code.
+- `deployment/` — API server (Flask) with `/generate`, `/health`, `/metrics` (optional auth via `API_TOKEN` env) and Dockerfile.
 - `examples/` — educational transformer implementation.
 - `openweb/` — Open WebUI + Ollama compose.
 - `results/`, `models/`, `logs/` — training artifacts (gitignored).
 
 ## Quickstart
 
-1. Install deps: `pip install -r requirements.txt`
-2. Prepare data (example): `python data/prepare_data.py`
-3. Train: `python scripts/train.py` (adjust paths inside as needed; expects `data/raw/wikipedia-en-0.json`)
-4. Evaluate perplexity: `python scripts/evaluate.py`
-5. Run inference helper: `python src/inference/generator.py`
+1. Install deps (prefer Python 3.12): `pip install -r requirements.txt`
+2. Link to external storage (optional): `python data/link_external.py --external-root /mnt/SSD1TB/ZYKE_DATA` (links `data/raw`, `data/processed`, `models`, `results`, `logs` to your mount).
+3. Build a cleaned dataset (streaming, weighted): `python data/build_dataset.py --sources openwebtext,wikipedia --output-dir data/processed --max-total 100000 --weights openwebtext=1,wikipedia=1 --local-dir data/raw/ebooks` (adjust weights/sources as needed).
+4. (Optional) Custom prep: `python data/prepare_data.py`
+5. Train: `python scripts/train.py --resume-latest` (data default `data/raw/wikipedia-en-0.json`, checkpoints `models/checkpoints`, final weights `models/latest`). LoRA adapter: add `--use-lora --adapter-name <name>` (saved under `models/adapters/<name>`), set targets via `--lora-target-modules`. Logging: `--log-to tensorboard|wandb` (set `WANDB_PROJECT`/token); push to Hub: `--hf-push`.
+6. Evaluate: `python scripts/evaluate.py --evals wikitext2,wikitext103,c4,lambada,piqa` (perplexity/accuracy + regression prompts). Test an adapter: `--adapter-path models/adapters/<name> --base-model gpt2`.
+7. Adapter use at inference: call `generate_npc_response(..., adapter_path="models/adapters/<name>")` or in CLI eval use `--adapter-path models/adapters/<name>`. Keep the base model consistent with the adapter’s training base.
+8. NPC schema inference: `python -m src.inference.generator` for persona/context → JSON. Safe-mode on by default; set `safe_mode=False` for raw output. Optional quantization: `quantization="4bit"` or `"8bit"` to lower VRAM/latency.
+9. Deployment API: `API_TOKEN=yourtoken python deployment/app.py` (Flask). Endpoints: `/health`, `/metrics`, `/generate` (POST JSON with persona/context/state/player_input, optional adapter_path/base_model, max_new_tokens, temperature, top_p, top_k, num_beams, safe_mode, quantization).
 
 Set `PYTHONPATH=.` if you import from `src/` in your own scripts.
 
@@ -32,3 +36,6 @@ Set `PYTHONPATH=.` if you import from `src/` in your own scripts.
 
 - Large datasets, checkpoints, and logs are gitignored; use external storage for big artifacts.
 - Deployment example is a simple Flask script; adapt to FastAPI or your stack as needed.
+- Logging/monitoring: `--log-to tensorboard` (logs under `logs/training`) or `--log-to wandb` (requires `WANDB_PROJECT`/token). Hub publish with `--hf-push`.
+- Adapter instructions: train with `--use-lora`, choose a name via `--adapter-name`, and configure targets via `--lora-target-modules`. Load at eval (`--adapter-path models/adapters/<name> --base-model gpt2`) or inference (`generate_npc_response(..., adapter_path=...)`). Keep the base model consistent with what the adapter was trained on.
+- Inference options: safe-mode filtering for NPC JSON outputs (toggleable), optional 4/8-bit quantization for lower latency/VRAM, and adapter loading for modular skills. API supports generation params (temperature/top_p/top_k/num_beams) and auth via `API_TOKEN`.

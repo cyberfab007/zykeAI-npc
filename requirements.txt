@@ -2,3 +2,6 @@ flask
 torch
 transformers
 datasets
+pytest
+accelerate
+peft
