@@ -31,6 +31,16 @@ def parse_args():
     parser.add_argument("--entropy-coef", type=float, default=0.01)
     parser.add_argument("--checkpoint-dir", default="models/checkpoints")
     parser.add_argument("--policy-version", type=int, default=0)
+    parser.add_argument(
+        "--base-llm-checkpoint",
+        default=None,
+        help="Optional path/name of a base LLM checkpoint to finetune (not used in stub MLP).",
+    )
+    parser.add_argument(
+        "--pull-blocks-endpoint",
+        default=None,
+        help="If set, periodically poll this endpoint (e.g., trainer /api/experience_block feed) to pull experience blocks.",
+    )
     return parser.parse_args()
 
 
@@ -103,8 +113,7 @@ def main():
     optimizer = make_optimizer(model, lr=args.lr, weight_decay=args.weight_decay)
     policy_version = args.policy_version
 
-    # TODO: replace with real ingestion from /api/experience_block
-    # buffer.extend(...)
+    # TODO: if args.pull_blocks_endpoint is set, poll for new blocks and add to buffer.
 
     while True:
         if len(buffer) < args.min_buffer:
