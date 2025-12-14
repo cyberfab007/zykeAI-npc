@@ -4,6 +4,7 @@ Aggregates LoRA-like deltas per base_model_version, advances policy_version, and
 """
 import base64
 import io
+import json
 import math
 import os
 import threading
@@ -146,10 +147,12 @@ aggregator: VersionedAggregator
 _ticker_thread: threading.Thread
 block_hashes: Dict[str, str] = {}
 task_history: List[Dict] = []
+queue_records: List[Dict] = []
+cluster_nodes: Dict[str, Dict] = {}
 
 
 def init_trainer():
-    global model, optimizer, aggregator, _ticker_thread, block_hashes, task_history
+    global model, optimizer, aggregator, _ticker_thread, block_hashes, task_history, queue_records, cluster_nodes
     Path(CHECKPOINT_DIR).mkdir(parents=True, exist_ok=True)
     model = MLPPolicy(obs_dim=128, action_dim=32)
     optimizer = make_optimizer(model)
@@ -168,6 +171,17 @@ def init_trainer():
         except Exception:
             block_hashes = {}
     task_history = []
+    queue_records = []
+    cluster_nodes = {
+        os.getenv("NODE_ID", "local"): {
+            "node_id": os.getenv("NODE_ID", "local"),
+            "state": "idle",
+            "blocks_completed": 0,
+            "trust_score": 1.0,
+            "last_seen": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "enabled": True,
+        }
+    }
     _ticker_thread = threading.Thread(target=_tick_loop, daemon=True)
     _ticker_thread.start()
 
@@ -193,15 +207,28 @@ def _tick_loop():
 
 @app.route("/get_task", methods=["GET"])
 def get_task():
+    selected_block = None
+    with state_lock:
+        # Assign first pending block if available
+        for rec in queue_records:
+            if rec.get("status") == "pending":
+                selected_block = rec
+                rec["status"] = "assigned"
+                rec["assigned_to"] = os.getenv("NODE_ID", "local")
+                rec["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                break
     with state_lock:
         task = {
             "task_id": str(uuid.uuid4()),
             "model_version": aggregator.current_version,
-            "data_shard_id": "stub",
+            "data_shard_id": selected_block["block_id"] if selected_block else "stub",
             "num_steps": 100,
             "learning_rate": 1e-4,
             "batch_size": 1,
         }
+        if selected_block:
+            task["block_id"] = selected_block["block_id"]
+            task["target_adapter"] = selected_block.get("target_adapter")
     return jsonify({"task": task})
 
 
@@ -228,6 +255,8 @@ def health():
 def worker_status():
     with state_lock:
         state = "training" if aggregator.pending_updates.get(aggregator.current_version) else "idle"
+        if not cluster_nodes.get(os.getenv("NODE_ID", "local"), {}).get("enabled", True):
+            state = "disabled"
         blocks = []
         for entry in task_history[-10:]:
             blocks.append(
@@ -308,6 +337,100 @@ def run_starter_test():
     return jsonify({"ok": True, "message": f"starter_test steps={len(losses)}, avg_loss={avg_loss:.4f}, time={elapsed:.2f}s"}), 200
 
 
+@app.route("/enqueue_blocks", methods=["POST"])
+def enqueue_blocks():
+    payload = request.get_json(force=True, silent=True) or {}
+    blocks_path = payload.get("blocks_path")
+    dataset_label = payload.get("dataset_label", "unknown")
+    target_adapter = payload.get("target_adapter")
+    if not blocks_path or not Path(blocks_path).exists():
+        return jsonify({"error": "blocks_path not found"}), 400
+    added = 0
+    with Path(blocks_path).open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                obj = {}
+            block_id = obj.get("block_id") or str(uuid.uuid4())
+            queue_records.append(
+                {
+                    "block_id": block_id,
+                    "task": dataset_label,
+                    "target_adapter": target_adapter,
+                    "status": "pending",
+                    "hash": obj.get("block_hash"),
+                    "assigned_to": None,
+                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+            added += 1
+    return jsonify({"message": f"Enqueued {added} blocks from {blocks_path}"}), 200
+
+
+@app.route("/queue_status", methods=["GET"])
+def queue_status():
+    with state_lock:
+        pending = sum(1 for b in queue_records if b.get("status") == "pending")
+        assigned = sum(1 for b in queue_records if b.get("status") == "assigned")
+        completed = sum(1 for b in queue_records if b.get("status") == "completed")
+        failed = sum(1 for b in queue_records if b.get("status") == "failed")
+        total = len(queue_records)
+        blocks = queue_records[-50:]
+    return jsonify(
+        {
+            "total": total,
+            "pending": pending,
+            "assigned": assigned,
+            "completed": completed,
+            "failed": failed,
+            "blocks": blocks,
+        }
+    )
+
+
+@app.route("/cluster_status", methods=["GET"])
+def cluster_status():
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    with state_lock:
+        nodes = []
+        for node_id, node in cluster_nodes.items():
+            node["last_seen"] = now
+            nodes.append(node.copy())
+    return jsonify({"nodes": nodes})
+
+
+@app.route("/disable_node", methods=["POST"])
+def disable_node():
+    payload = request.get_json(force=True, silent=True) or {}
+    node_id = payload.get("node_id")
+    if not node_id:
+        return jsonify({"error": "node_id required"}), 400
+    with state_lock:
+        if node_id not in cluster_nodes:
+            return jsonify({"error": "node not found"}), 404
+        cluster_nodes[node_id]["enabled"] = False
+        cluster_nodes[node_id]["state"] = "disabled"
+    return jsonify({"message": f"Node {node_id} disabled"}), 200
+
+
+@app.route("/enable_node", methods=["POST"])
+def enable_node():
+    payload = request.get_json(force=True, silent=True) or {}
+    node_id = payload.get("node_id")
+    if not node_id:
+        return jsonify({"error": "node_id required"}), 400
+    with state_lock:
+        if node_id not in cluster_nodes:
+            return jsonify({"error": "node not found"}), 404
+        cluster_nodes[node_id]["enabled"] = True
+        cluster_nodes[node_id]["state"] = "idle"
+    return jsonify({"message": f"Node {node_id} enabled"}), 200
+
+
 def metrics_valid(metrics: Dict) -> bool:
     if not metrics:
         return True
@@ -335,6 +458,7 @@ def submit_update():
     if not metrics_valid(metrics):
         return jsonify({"accepted": False, "reason": "metrics_invalid"}), 400
 
+    block_id = payload.get("block_id")
     if REQUIRE_BLOCK_HASH:
         if "block_id" not in payload or "block_hash" not in payload:
             return jsonify({"accepted": False, "reason": "block_hash_required"}), 400
@@ -344,7 +468,6 @@ def submit_update():
         if canonical_hash is None:
             return jsonify({"accepted": False, "reason": "unknown_block_id"}), 400
     else:
-        block_id = None
         submitted_hash = None
         canonical_hash = None
 
@@ -372,12 +495,18 @@ def submit_update():
         # Record task in history
         task_history.append(
             {
-                "block_id": payload.get("block_id", ""),
+                "block_id": block_id or "",
                 "status": "submitted",
                 "loss": metrics.get("train_loss_mean", None) if isinstance(metrics, dict) else None,
                 "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
         )
+        if block_id:
+            for rec in queue_records:
+                if rec.get("block_id") == block_id:
+                    rec["status"] = "completed"
+                    rec["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                    break
         # Save checkpoint if we aggregated this round
         if aggregated:
             apply_agg_state_to_model()

@@ -16,7 +16,7 @@ import subprocess
 import threading
 import time
 import tkinter as tk
-from tkinter import messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 import requests
 
@@ -204,6 +204,9 @@ class CommandStation(tk.Tk):
         ttk.Entry(builder_frame, textvariable=self.input_path_var, width=40).grid(
             row=0, column=1, sticky="we"
         )
+        ttk.Button(builder_frame, text="Browse", command=self.browse_dataset).grid(
+            row=0, column=2, sticky="we", padx=2
+        )
 
         ttk.Label(builder_frame, text="Output blocks file:").grid(row=1, column=0, sticky="w")
         ttk.Entry(builder_frame, textvariable=self.output_path_var, width=40).grid(
@@ -283,35 +286,43 @@ class CommandStation(tk.Tk):
         self.test_state = tk.StringVar(value="idle")
         self.test_player = tk.StringVar(value="Hello there")
         self.test_adapter_name = tk.StringVar(value="")
+        self.test_audience = tk.StringVar(value="adult")
 
         ttk.Label(infer_frame, text="Adapter name:").grid(row=0, column=0, sticky="w")
         ttk.Entry(infer_frame, textvariable=self.test_adapter_name, width=25).grid(
             row=0, column=1, sticky="we"
         )
-
-        ttk.Label(infer_frame, text="Persona:").grid(row=1, column=0, sticky="w")
-        ttk.Entry(infer_frame, textvariable=self.test_persona, width=25).grid(
-            row=1, column=1, sticky="we"
+        ttk.Label(infer_frame, text="Audience (adult/minor):").grid(row=1, column=0, sticky="w")
+        ttk.Entry(infer_frame, textvariable=self.test_audience, width=15).grid(
+            row=1, column=1, sticky="w"
         )
 
-        ttk.Label(infer_frame, text="Context:").grid(row=2, column=0, sticky="w")
-        ttk.Entry(infer_frame, textvariable=self.test_context, width=25).grid(
+        ttk.Label(infer_frame, text="Persona:").grid(row=2, column=0, sticky="w")
+        ttk.Entry(infer_frame, textvariable=self.test_persona, width=25).grid(
             row=2, column=1, sticky="we"
         )
 
-        ttk.Label(infer_frame, text="State:").grid(row=3, column=0, sticky="w")
-        ttk.Entry(infer_frame, textvariable=self.test_state, width=25).grid(
+        ttk.Label(infer_frame, text="Context:").grid(row=3, column=0, sticky="w")
+        ttk.Entry(infer_frame, textvariable=self.test_context, width=25).grid(
             row=3, column=1, sticky="we"
         )
 
-        ttk.Label(infer_frame, text="Player input:").grid(row=4, column=0, sticky="w")
-        ttk.Entry(infer_frame, textvariable=self.test_player, width=40).grid(
+        ttk.Label(infer_frame, text="State:").grid(row=4, column=0, sticky="w")
+        ttk.Entry(infer_frame, textvariable=self.test_state, width=25).grid(
             row=4, column=1, sticky="we"
         )
 
-        ttk.Button(infer_frame, text="Send to Model", command=self.run_live_inference).grid(
-            row=5, column=0, columnspan=2, sticky="we", pady=4
+        ttk.Label(infer_frame, text="Player input:").grid(row=5, column=0, sticky="w")
+        ttk.Entry(infer_frame, textvariable=self.test_player, width=40).grid(
+            row=5, column=1, sticky="we"
         )
+
+        ttk.Button(infer_frame, text="Send to Model", command=self.run_live_inference).grid(
+            row=6, column=0, columnspan=2, sticky="we", pady=4
+        )
+        self.infer_output = scrolledtext.ScrolledText(infer_frame, wrap="word", height=8, state="disabled")
+        self.infer_output.grid(row=7, column=0, columnspan=2, sticky="nsew", padx=2, pady=2)
+        infer_frame.rowconfigure(7, weight=1)
 
     # Worker control -----------------------------------------------------
     def start_worker(self):
@@ -628,6 +639,15 @@ class CommandStation(tk.Tk):
 
         threading.Thread(target=_task, daemon=True).start()
 
+    # File picker -------------------------------------------------------
+    def browse_dataset(self):
+        path = filedialog.askopenfilename(
+            title="Select dataset file",
+            filetypes=[("JSONL files", "*.jsonl"), ("All files", "*.*")],
+        )
+        if path:
+            self.input_path_var.set(path)
+
     # Live inference -----------------------------------------------------
     def run_live_inference(self):
         def _task():
@@ -636,20 +656,32 @@ class CommandStation(tk.Tk):
                 "context": self.test_context.get(),
                 "state": self.test_state.get(),
                 "player_input": self.test_player.get(),
+                "audience": self.test_audience.get() if hasattr(self, "test_audience") else "adult",
             }
             if self.test_adapter_name.get():
                 payload["adapter_name"] = self.test_adapter_name.get()
             try:
                 url = self.inference_url_var.get().rstrip("/")
+                start = time.time()
                 resp = requests.post(url, json=payload, timeout=20)
+                elapsed = (time.time() - start) * 1000.0
                 resp.raise_for_status()
                 data = resp.json()
-                self._log(f"Inference response: {data}")
+                self._log(f"Inference response ({elapsed:.1f} ms): {data}")
+                self._append_infer_output(f"Latency: {elapsed:.1f} ms\n{data}\n")
             except Exception as e:
                 self._log(f"Inference error: {e}")
                 messagebox.showerror("Inference Error", f"{e}")
 
         threading.Thread(target=_task, daemon=True).start()
+
+    def _append_infer_output(self, msg: str):
+        if not hasattr(self, "infer_output"):
+            return
+        self.infer_output.configure(state="normal")
+        self.infer_output.insert("end", msg + "\n")
+        self.infer_output.see("end")
+        self.infer_output.configure(state="disabled")
 
 
 def main():
