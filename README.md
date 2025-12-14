@@ -1,4 +1,4 @@
-# GPT Training Project
+# ZykeAI Prototype Ichoronium Galactic Space Networks NPC AI 
 
 Scripts and scaffolding to fine-tune modern open models (default: **LLaMA 13B**) with **Hugging Face Transformers**, optional **LoRA adapters**, and deploy behind a simple HTTP API.
 
