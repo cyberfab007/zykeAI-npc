@@ -17,9 +17,12 @@ import torch
 from flask import Flask, jsonify, request
 
 from trainer.checkpointing import save_checkpoint
+from trainer.lora_checkpointing import load_latest_lora_checkpoint, save_lora_checkpoint
 from trainer.models import MLPPolicy, make_optimizer
 from trainer.update_validation import UpdateRejected, trimmed_mean, validate_update
 from trainer.weights import load_latest_checkpoint
+
+TRAINER_BACKEND = os.getenv("TRAINER_BACKEND", "mlp").lower()  # "mlp" | "llm"
 
 NUM_TASKS_PER_ROUND = int(os.getenv("NUM_TASKS_PER_ROUND", "3"))
 MIN_UPDATES_PER_ROUND = int(os.getenv("MIN_UPDATES_PER_ROUND", "1"))
@@ -37,7 +40,8 @@ app = Flask(__name__)
 
 
 def get_trainable_state(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
-    return {k: v.detach().clone() for k, v in model.named_parameters() if v.requires_grad}
+    # Keep aggregation state on CPU to reduce GPU memory pressure and make serialization cheap.
+    return {k: v.detach().to("cpu").clone() for k, v in model.named_parameters() if v.requires_grad}
 
 
 def decode_delta(delta_b64: str) -> Dict[str, torch.Tensor]:
@@ -142,25 +146,92 @@ class VersionedAggregator:
 # Global trainer state
 state_lock = threading.Lock()
 model: torch.nn.Module
-optimizer: torch.optim.Optimizer
+optimizer: torch.optim.Optimizer | None
 aggregator: VersionedAggregator
 _ticker_thread: threading.Thread
 block_hashes: Dict[str, str] = {}
 task_history: List[Dict] = []
 queue_records: List[Dict] = []
 cluster_nodes: Dict[str, Dict] = {}
+llm_base_model: str | None = None
+llm_tokenizer_name: str | None = None
+llm_adapter_name: str | None = None
 
 
 def init_trainer():
     global model, optimizer, aggregator, _ticker_thread, block_hashes, task_history, queue_records, cluster_nodes
+    global llm_base_model, llm_tokenizer_name, llm_adapter_name
     Path(CHECKPOINT_DIR).mkdir(parents=True, exist_ok=True)
-    model = MLPPolicy(obs_dim=128, action_dim=32)
-    optimizer = make_optimizer(model)
-    loaded_version = load_latest_checkpoint(model, optimizer, CHECKPOINT_DIR)
-    current_version = loaded_version if loaded_version is not None else 0
-    aggregator = VersionedAggregator(get_trainable_state(model), current_version)
-    if loaded_version is None:
-        save_checkpoint(model, optimizer, current_version, CHECKPOINT_DIR)
+    if TRAINER_BACKEND == "llm":
+        # LLM LoRA delta backend: maintain trainable LoRA weights only (no full-base checkpointing).
+        llm_adapter_name = os.getenv("LLM_ADAPTER_NAME") or os.getenv("ADAPTER_NAME")
+        manifest_path = os.getenv("LLM_MANIFEST_PATH", "data/adapters/manifest.json")
+        if not llm_adapter_name:
+            # Default: open, small baseline for iteration.
+            llm_adapter_name = "npc_core_pythia_410m_v1"
+
+        try:
+            from src.models.adapter_manifest import select_adapter
+
+            _adapter_path, entry = select_adapter(llm_adapter_name, manifest_path)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load adapter manifest entry '{llm_adapter_name}': {exc}") from exc
+
+        llm_base_model = str(entry.get("base_model") or os.getenv("LLM_BASE_MODEL") or "EleutherAI/pythia-410m-deduped")
+        llm_tokenizer_name = os.getenv("LLM_TOKENIZER") or llm_base_model
+        target_modules = entry.get("target_modules") or []
+        r = int(entry.get("r") or os.getenv("LLM_LORA_R", "16"))
+        alpha = int(entry.get("lora_alpha") or os.getenv("LLM_LORA_ALPHA", "32"))
+        dropout = float(entry.get("lora_dropout") or os.getenv("LLM_LORA_DROPOUT", "0.05"))
+
+        from transformers import AutoModelForCausalLM
+
+        try:
+            from peft import LoraConfig, get_peft_model
+        except ImportError as exc:
+            raise RuntimeError("peft is required for TRAINER_BACKEND=llm") from exc
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dtype = torch.bfloat16 if (device.type == "cuda" and torch.cuda.is_bf16_supported()) else (torch.float16 if device.type == "cuda" else None)
+        base = AutoModelForCausalLM.from_pretrained(llm_base_model, trust_remote_code=True, torch_dtype=dtype)
+        base.to(device)
+        lora_cfg = LoraConfig(
+            r=r,
+            lora_alpha=alpha,
+            lora_dropout=dropout,
+            target_modules=target_modules,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(base, lora_cfg)
+        optimizer = None
+
+        loaded = load_latest_lora_checkpoint(CHECKPOINT_DIR)
+        if loaded:
+            loaded_version, lora_state, _meta = loaded
+            # Apply loaded trainable weights onto the model.
+            state_dict = model.state_dict()
+            state_dict.update(lora_state)
+            model.load_state_dict(state_dict)
+            current_version = loaded_version
+        else:
+            current_version = 0
+        aggregator = VersionedAggregator(get_trainable_state(model), current_version)
+        if not loaded:
+            save_lora_checkpoint(
+                lora_state=aggregator.get_current_state(),
+                version=current_version,
+                output_dir=CHECKPOINT_DIR,
+                metadata={"adapter_name": llm_adapter_name, "base_model": llm_base_model},
+            )
+    else:
+        model = MLPPolicy(obs_dim=128, action_dim=32)
+        optimizer = make_optimizer(model)
+        loaded_version = load_latest_checkpoint(model, optimizer, CHECKPOINT_DIR)
+        current_version = loaded_version if loaded_version is not None else 0
+        aggregator = VersionedAggregator(get_trainable_state(model), current_version)
+        if loaded_version is None:
+            save_checkpoint(model, optimizer, current_version, CHECKPOINT_DIR)
     # Load block hash map if provided
     if BLOCK_HASH_MAP:
         try:
@@ -189,9 +260,14 @@ def init_trainer():
 def apply_agg_state_to_model():
     global model
     trainable_state = aggregator.get_current_state()
-    state_dict = model.state_dict()
-    state_dict.update(trainable_state)
-    model.load_state_dict(state_dict)
+    # Avoid materializing a full state_dict for large base LMs; only patch trainable params.
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if name in trainable_state:
+                src = trainable_state[name].to(device=param.device, dtype=param.dtype)
+                param.copy_(src)
 
 
 def _tick_loop():
@@ -202,7 +278,16 @@ def _tick_loop():
             aggregated = aggregator.tick()
             if aggregated:
                 apply_agg_state_to_model()
-                save_checkpoint(model, optimizer, aggregator.current_version, CHECKPOINT_DIR)
+                if TRAINER_BACKEND == "llm":
+                    save_lora_checkpoint(
+                        lora_state=aggregator.get_current_state(),
+                        version=aggregator.current_version,
+                        output_dir=CHECKPOINT_DIR,
+                        metadata={"adapter_name": llm_adapter_name, "base_model": llm_base_model},
+                    )
+                else:
+                    assert optimizer is not None
+                    save_checkpoint(model, optimizer, aggregator.current_version, CHECKPOINT_DIR)
 
 
 @app.route("/get_task", methods=["GET"])
@@ -228,7 +313,13 @@ def get_task():
         }
         if selected_block:
             task["block_id"] = selected_block["block_id"]
+            task["block_hash"] = selected_block.get("hash")
             task["target_adapter"] = selected_block.get("target_adapter")
+        task["trainer_backend"] = TRAINER_BACKEND
+        if TRAINER_BACKEND == "llm":
+            task["adapter_name"] = llm_adapter_name
+            task["base_model"] = llm_base_model
+            task["tokenizer"] = llm_tokenizer_name
     return jsonify({"task": task})
 
 
@@ -271,13 +362,15 @@ def worker_status():
             "node_id": os.getenv("NODE_ID", "local"),
             "state": state,
             "base_model_version": aggregator.current_version if aggregator else None,
-            "adapter_name": None,
+            "adapter_name": llm_adapter_name if TRAINER_BACKEND == "llm" else None,
             "quantization": None,
             "use_flash_attn": False,
             "compile_model": False,
             "blocks_processed": len(task_history),
             "blocks": blocks,
             "device": "cuda" if torch.cuda.is_available() else "cpu",
+            "trainer_backend": TRAINER_BACKEND,
+            "base_model": llm_base_model if TRAINER_BACKEND == "llm" else None,
         }
     return jsonify(status), 200
 
@@ -300,11 +393,51 @@ def run_starter_test():
 
     start = time.time()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MLPPolicy(obs_dim=32, action_dim=8).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-
     losses = []
-    max_steps = 50
+    max_steps = 20
+
+    if TRAINER_BACKEND != "llm":
+        # Fast MLP-only placeholder.
+        tmp_model = MLPPolicy(obs_dim=32, action_dim=8).to(device)
+        opt = torch.optim.Adam(tmp_model.parameters(), lr=1e-3)
+        step = 0
+        for f in files:
+            with f.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    if step >= max_steps:
+                        break
+                    try:
+                        obj = json.loads(line)
+                        text = (obj.get("input", "") + " " + obj.get("target", "")).strip()
+                    except Exception:
+                        text = ""
+                    feat = len(text) % 100
+                    obs = torch.tensor([[feat] + [0] * 31], dtype=torch.float32, device=device)
+                    logits, _ = tmp_model(obs)
+                    target = torch.tensor([feat % 8], dtype=torch.long, device=device)
+                    loss = torch.nn.functional.cross_entropy(logits, target)
+                    opt.zero_grad()
+                    loss.backward()
+                    opt.step()
+                    losses.append(loss.item())
+                    step += 1
+        elapsed = time.time() - start
+        avg_loss = sum(losses) / len(losses) if losses else float("nan")
+        return (
+            jsonify({"ok": True, "message": f"starter_test(mlp) steps={len(losses)}, avg_loss={avg_loss:.4f}, time={elapsed:.2f}s"}),
+            200,
+        )
+
+    # LLM backend: do a tiny LoRA step over starter-block pairs.
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(llm_tokenizer_name or llm_base_model, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(trainable_params, lr=1e-4)
+    model.train()
     step = 0
     for f in files:
         with f.open("r", encoding="utf-8") as fh:
@@ -312,29 +445,35 @@ def run_starter_test():
                 if step >= max_steps:
                     break
                 try:
-                    import json
-
                     obj = json.loads(line)
-                    text = (obj.get("input", "") + " " + obj.get("target", "")).strip()
                 except Exception:
-                    text = ""
-                # simple feature: length mod some number
-                feat = len(text) % 100
-                obs = torch.tensor([[feat] + [0] * 31], dtype=torch.float32, device=device)
-                logits, _ = model(obs)
-                target = torch.tensor([feat % 8], dtype=torch.long, device=device)
-                loss = torch.nn.functional.cross_entropy(logits, target)
+                    continue
+                prompt = str(obj.get("input", "")).rstrip() + "\n"
+                target = str(obj.get("target", "")).strip()
+                if not prompt.strip() or not target:
+                    continue
+                prompt_ids = tokenizer(prompt, add_special_tokens=True, truncation=True, max_length=256).input_ids
+                target_ids = tokenizer(target, add_special_tokens=False, truncation=True, max_length=256).input_ids
+                input_ids = (prompt_ids + target_ids)[:256]
+                labels = ([-100] * len(prompt_ids) + target_ids)[:256]
+                input_ids_t = torch.tensor([input_ids], dtype=torch.long, device=device)
+                labels_t = torch.tensor([labels], dtype=torch.long, device=device)
+                attn = torch.ones_like(input_ids_t)
+                out = model(input_ids=input_ids_t, attention_mask=attn, labels=labels_t)
+                loss = out.loss
                 opt.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
                 opt.step()
-                losses.append(loss.item())
+                losses.append(float(loss.item()))
                 step += 1
-                if step >= max_steps:
-                    break
-
+    model.eval()
     elapsed = time.time() - start
     avg_loss = sum(losses) / len(losses) if losses else float("nan")
-    return jsonify({"ok": True, "message": f"starter_test steps={len(losses)}, avg_loss={avg_loss:.4f}, time={elapsed:.2f}s"}), 200
+    return (
+        jsonify({"ok": True, "message": f"starter_test(llm) steps={len(losses)}, avg_loss={avg_loss:.4f}, time={elapsed:.2f}s"}),
+        200,
+    )
 
 
 @app.route("/enqueue_blocks", methods=["POST"])
@@ -363,12 +502,25 @@ def enqueue_blocks():
                     "target_adapter": target_adapter,
                     "status": "pending",
                     "hash": obj.get("block_hash"),
+                    "block_data": obj,
                     "assigned_to": None,
                     "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 }
             )
             added += 1
     return jsonify({"message": f"Enqueued {added} blocks from {blocks_path}"}), 200
+
+
+@app.route("/get_block", methods=["GET"])
+def get_block():
+    block_id = request.args.get("block_id")
+    if not block_id:
+        return jsonify({"error": "block_id required"}), 400
+    with state_lock:
+        for rec in queue_records:
+            if rec.get("block_id") == block_id:
+                return jsonify({"block": rec.get("block_data")}), 200
+    return jsonify({"error": "block not found"}), 404
 
 
 @app.route("/queue_status", methods=["GET"])
@@ -379,7 +531,19 @@ def queue_status():
         completed = sum(1 for b in queue_records if b.get("status") == "completed")
         failed = sum(1 for b in queue_records if b.get("status") == "failed")
         total = len(queue_records)
-        blocks = queue_records[-50:]
+        blocks = []
+        for rec in queue_records[-50:]:
+            blocks.append(
+                {
+                    "block_id": rec.get("block_id"),
+                    "task": rec.get("task"),
+                    "target_adapter": rec.get("target_adapter"),
+                    "status": rec.get("status"),
+                    "hash": rec.get("hash"),
+                    "assigned_to": rec.get("assigned_to"),
+                    "updated_at": rec.get("updated_at"),
+                }
+            )
     return jsonify(
         {
             "total": total,
@@ -466,6 +630,11 @@ def submit_update():
         submitted_hash = payload["block_hash"]
         canonical_hash = block_hashes.get(block_id)
         if canonical_hash is None:
+            for rec in queue_records:
+                if rec.get("block_id") == block_id:
+                    canonical_hash = rec.get("hash")
+                    break
+        if canonical_hash is None:
             return jsonify({"accepted": False, "reason": "unknown_block_id"}), 400
     else:
         submitted_hash = None
@@ -510,7 +679,16 @@ def submit_update():
         # Save checkpoint if we aggregated this round
         if aggregated:
             apply_agg_state_to_model()
-            save_checkpoint(model, optimizer, aggregator.current_version, CHECKPOINT_DIR)
+            if TRAINER_BACKEND == "llm":
+                save_lora_checkpoint(
+                    lora_state=aggregator.get_current_state(),
+                    version=aggregator.current_version,
+                    output_dir=CHECKPOINT_DIR,
+                    metadata={"adapter_name": llm_adapter_name, "base_model": llm_base_model},
+                )
+            else:
+                assert optimizer is not None
+                save_checkpoint(model, optimizer, aggregator.current_version, CHECKPOINT_DIR)
     return jsonify({"accepted": True, "current_policy_version": aggregator.current_version})
 
 

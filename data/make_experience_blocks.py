@@ -12,6 +12,7 @@ Each block conforms to schemas/experience_block.json:
 }
 """
 import argparse
+import hashlib
 import json
 import uuid
 from pathlib import Path
@@ -101,6 +102,8 @@ def write_blocks(
                         "npc_type": npc_type,
                         "steps": block_steps,
                     }
+                    canonical = json.dumps(block, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                    block["block_hash"] = hashlib.sha256(canonical).hexdigest()
                     f.write(json.dumps(block) + "\n")
                     written += 1
                     block_steps = []
@@ -115,6 +118,8 @@ def write_blocks(
                 "npc_type": npc_type,
                 "steps": block_steps,
             }
+            canonical = json.dumps(block, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            block["block_hash"] = hashlib.sha256(canonical).hexdigest()
             f.write(json.dumps(block) + "\n")
 
 

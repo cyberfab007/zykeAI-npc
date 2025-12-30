@@ -1,725 +1,398 @@
 #!/usr/bin/env python3
 """
-Local Command Station GUI to manage a worker node and block/cluster state:
-- Start/stop the local worker process
-- View node/model status from /worker_status
-- View and manage the global training block queue
-- View and manage cluster nodes (with state/trust color-coding)
-- Run starter-block smoke test via /run_starter_test
-- Build experience blocks from prepared data
-- Send quick test prompts to the live inference API
+Training entrypoint for ZykeAI.
 
-Adjust TRAINER_URL, INFERENCE_URL, WORKER_CMD, and expected API schemas to your environment.
+Supports:
+- Full fine-tune of a HF causal LM
+- LoRA adapter training (recommended)
+- Resume from latest checkpoint
+- Standardized output dirs:
+    - checkpoints: models/checkpoints
+    - final/latest: models/latest
+    - adapters: models/adapters/<adapter_name>
+
+Notes:
+- Adapters are only compatible with the base model they were trained on.
+- For smaller, fully open models that work well with this stack, consider:
+  EleutherAI/pythia-410m-deduped or EleutherAI/pythia-1.4b-deduped
 """
-import queue
-import subprocess
-import threading
-import time
-import tkinter as tk
-from tkinter import messagebox, scrolledtext, ttk
-
-import requests
-
-# ---------------------------
-# Config – adjust to your setup
-# ---------------------------
-
-TRAINER_URL = "http://localhost:5001"  # trainer/server base URL
-INFERENCE_URL = "http://localhost:5000/generate"  # inference API for live test calls
-WORKER_CMD = ["python", "-m", "actors.worker", "--trainer-url", TRAINER_URL]
-
-STATUS_ENDPOINT = "/worker_status"
-STARTER_TEST_ENDPOINT = "/run_starter_test"
-
-# Endpoints for queue + cluster management.
-QUEUE_STATUS_ENDPOINT = "/queue_status"
-ENQUEUE_BLOCKS_ENDPOINT = "/enqueue_blocks"
-CLUSTER_STATUS_ENDPOINT = "/cluster_status"
-DISABLE_NODE_ENDPOINT = "/disable_node"
-ENABLE_NODE_ENDPOINT = "/enable_node"
-
-
-class CommandStation(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("Training Command Station")
-        self.geometry("1200x700")
-
-        self.worker_process = None
-        self.log_queue = queue.Queue()
-
-        self._build_layout()
-
-        # Periodic background polling.
-        self.after(2000, self._poll_status_loop)
-        self.after(250, self._poll_log_queue)
-
-    # Layout -------------------------------------------------------------
-    def _build_layout(self):
-        # ---------------- Top: node + model + controls -----------------
-        top_frame = ttk.Frame(self)
-        top_frame.pack(fill="x", padx=10, pady=10)
-
-        # Node status
-        node_frame = ttk.LabelFrame(top_frame, text="Node Status")
-        node_frame.pack(side="left", fill="both", expand=True, padx=5)
-
-        self.node_status_var = tk.StringVar(value="Stopped")
-        self.node_id_var = tk.StringVar(value="unknown")
-        self.trainer_url_var = tk.StringVar(value=TRAINER_URL)
-        self.inference_url_var = tk.StringVar(value=INFERENCE_URL)
-
-        ttk.Label(node_frame, text="Node ID:").grid(row=0, column=0, sticky="w")
-        ttk.Label(node_frame, textvariable=self.node_id_var).grid(row=0, column=1, sticky="w")
-
-        ttk.Label(node_frame, text="Status:").grid(row=1, column=0, sticky="w")
-        # keep a handle so we can color it
-        self.node_status_label = ttk.Label(node_frame, textvariable=self.node_status_var)
-        self.node_status_label.grid(row=1, column=1, sticky="w")
-
-        ttk.Label(node_frame, text="Trainer URL:").grid(row=2, column=0, sticky="w")
-        trainer_entry = ttk.Entry(node_frame, textvariable=self.trainer_url_var, width=40)
-        trainer_entry.grid(row=2, column=1, sticky="w")
-
-        ttk.Label(node_frame, text="Inference URL:").grid(row=3, column=0, sticky="w")
-        infer_entry = ttk.Entry(node_frame, textvariable=self.inference_url_var, width=40)
-        infer_entry.grid(row=3, column=1, sticky="w")
-
-        # Model status
-        model_frame = ttk.LabelFrame(top_frame, text="Model / Adapter")
-        model_frame.pack(side="left", fill="both", expand=True, padx=5)
-
-        self.base_version_var = tk.StringVar(value="-")
-        self.adapter_name_var = tk.StringVar(value="-")
-        self.quantization_var = tk.StringVar(value="-")
-        self.flash_var = tk.StringVar(value="-")
-        self.compile_var = tk.StringVar(value="-")
-        self.blocks_processed_var = tk.StringVar(value="0")
-
-        row = 0
-        ttk.Label(model_frame, text="Base version:").grid(row=row, column=0, sticky="w")
-        ttk.Label(model_frame, textvariable=self.base_version_var).grid(row=row, column=1, sticky="w")
-        row += 1
-
-        ttk.Label(model_frame, text="Adapter:").grid(row=row, column=0, sticky="w")
-        ttk.Label(model_frame, textvariable=self.adapter_name_var).grid(row=row, column=1, sticky="w")
-        row += 1
-
-        ttk.Label(model_frame, text="Quantization:").grid(row=row, column=0, sticky="w")
-        ttk.Label(model_frame, textvariable=self.quantization_var).grid(row=row, column=1, sticky="w")
-        row += 1
-
-        ttk.Label(model_frame, text="Flash Attn:").grid(row=row, column=0, sticky="w")
-        ttk.Label(model_frame, textvariable=self.flash_var).grid(row=row, column=1, sticky="w")
-        row += 1
-
-        ttk.Label(model_frame, text="torch.compile:").grid(row=row, column=0, sticky="w")
-        ttk.Label(model_frame, textvariable=self.compile_var).grid(row=row, column=1, sticky="w")
-        row += 1
-
-        ttk.Label(model_frame, text="Blocks processed:").grid(row=row, column=0, sticky="w")
-        ttk.Label(model_frame, textvariable=self.blocks_processed_var).grid(row=row, column=1, sticky="w")
-        row += 1
-
-        # Control buttons
-        control_frame = ttk.Frame(top_frame)
-        control_frame.pack(side="right", fill="y", padx=5)
-
-        ttk.Button(control_frame, text="Start Worker", command=self.start_worker).pack(fill="x", pady=2)
-        ttk.Button(control_frame, text="Stop Worker", command=self.stop_worker).pack(fill="x", pady=2)
-        ttk.Button(control_frame, text="Refresh Status", command=self.refresh_status).pack(fill="x", pady=2)
-        ttk.Button(control_frame, text="Run Starter Block Test", command=self.run_starter_test).pack(
-            fill="x", pady=8
-        )
-
-        # ---------------- Middle: assigned blocks + logs ----------------
-        middle_frame = ttk.PanedWindow(self, orient="horizontal")
-        middle_frame.pack(fill="both", expand=True, padx=10, pady=5)
-
-        blocks_frame = ttk.LabelFrame(middle_frame, text="Assigned Blocks (this node)")
-        middle_frame.add(blocks_frame, weight=3)
-
-        columns = ("block_id", "status", "loss", "updated_at")
-        style = ttk.Style(self)
-        style.configure("Blocks.Treeview", rowheight=24)
-
-        self.blocks_tree = ttk.Treeview(
-            blocks_frame, columns=columns, show="headings", height=8, style="Blocks.Treeview"
-        )
-        for col in columns:
-            self.blocks_tree.heading(col, text=col)
-            self.blocks_tree.column(col, width=140)
-        self.blocks_tree.pack(fill="both", expand=True)
-
-        log_frame = ttk.LabelFrame(middle_frame, text="Logs")
-        middle_frame.add(log_frame, weight=2)
-
-        self.log_text = scrolledtext.ScrolledText(log_frame, wrap="word", state="disabled")
-        self.log_text.pack(fill="both", expand=True)
-
-        # ---------------- Cluster Nodes panel ----------------
-        cluster_frame = ttk.LabelFrame(self, text="Cluster Nodes")
-        cluster_frame.pack(fill="both", expand=False, padx=10, pady=5)
-
-        cluster_inner = ttk.Frame(cluster_frame)
-        cluster_inner.pack(fill="both", expand=True)
-
-        cluster_columns = ("node_id", "state", "blocks_done", "trust", "last_seen")
-        self.cluster_tree = ttk.Treeview(
-            cluster_inner, columns=cluster_columns, show="headings", height=6
-        )
-        for col in cluster_columns:
-            self.cluster_tree.heading(col, text=col)
-            width = 140 if col != "last_seen" else 200
-            self.cluster_tree.column(col, width=width)
-        self.cluster_tree.pack(side="left", fill="both", expand=True)
-
-        # Color tags for cluster nodes (background by state)
-        self.cluster_tree.tag_configure("state_idle", background="#203820")       # dark-ish green
-        self.cluster_tree.tag_configure("state_training", background="#203048")   # dark-ish blue
-        self.cluster_tree.tag_configure("state_error", background="#3a2020")      # dark-ish red
-        self.cluster_tree.tag_configure("state_disabled", background="#303030")   # gray
-
-        # Foreground by trust score
-        self.cluster_tree.tag_configure("trust_low", foreground="#ff6b6b")        # red
-        self.cluster_tree.tag_configure("trust_mid", foreground="#ffb86c")        # orange
-
-        cluster_btns = ttk.Frame(cluster_inner)
-        cluster_btns.pack(side="right", fill="y", padx=5)
-
-        ttk.Button(cluster_btns, text="Refresh Cluster", command=self.refresh_cluster_status).pack(
-            fill="x", pady=2
-        )
-        ttk.Button(cluster_btns, text="Disable Node", command=self.disable_selected_node).pack(
-            fill="x", pady=2
-        )
-        ttk.Button(cluster_btns, text="Enable Node", command=self.enable_selected_node).pack(
-            fill="x", pady=2
-        )
-
-        # ---------------- Bottom: block builder + queue + inference -----
-        bottom_frame = ttk.Frame(self)
-        bottom_frame.pack(fill="both", expand=False, padx=10, pady=5)
-
-        # Block builder
-        builder_frame = ttk.LabelFrame(bottom_frame, text="Block Builder (local)")
-        builder_frame.pack(side="left", fill="both", expand=True, padx=5)
-
-        self.input_path_var = tk.StringVar(value="data/raw/ebooks")
-        self.output_path_var = tk.StringVar(
-            value="data/processed/experience_blocks.jsonl"
-        )
-        self.dataset_label_var = tk.StringVar(value="dev_dataset")
-        self.block_adapter_var = tk.StringVar(value="")
-
-        ttk.Label(builder_frame, text="Input path/file:").grid(row=0, column=0, sticky="w")
-        ttk.Entry(builder_frame, textvariable=self.input_path_var, width=40).grid(
-            row=0, column=1, sticky="we"
-        )
-
-        ttk.Label(builder_frame, text="Output blocks file:").grid(row=1, column=0, sticky="w")
-        ttk.Entry(builder_frame, textvariable=self.output_path_var, width=40).grid(
-            row=1, column=1, sticky="we"
-        )
-
-        ttk.Label(builder_frame, text="Dataset label:").grid(row=2, column=0, sticky="w")
-        ttk.Entry(builder_frame, textvariable=self.dataset_label_var, width=25).grid(
-            row=2, column=1, sticky="w"
-        )
-
-        ttk.Label(builder_frame, text="Target adapter (optional):").grid(
-            row=3, column=0, sticky="w"
-        )
-        ttk.Entry(builder_frame, textvariable=self.block_adapter_var, width=25).grid(
-            row=3, column=1, sticky="w"
-        )
-
-        ttk.Button(builder_frame, text="Build Blocks Locally", command=self.run_block_builder).grid(
-            row=4, column=0, columnspan=2, sticky="we", pady=4
-        )
-
-        # Block queue controls (talks to trainer)
-        queue_frame = ttk.LabelFrame(bottom_frame, text="Global Block Queue")
-        queue_frame.pack(side="left", fill="both", expand=True, padx=5)
-
-        # Summary labels
-        self.queue_total_var = tk.StringVar(value="0")
-        self.queue_pending_var = tk.StringVar(value="0")
-        self.queue_assigned_var = tk.StringVar(value="0")
-        self.queue_completed_var = tk.StringVar(value="0")
-        self.queue_failed_var = tk.StringVar(value="0")
-
-        qrow = 0
-        ttk.Label(queue_frame, text="Total:").grid(row=qrow, column=0, sticky="w")
-        ttk.Label(queue_frame, textvariable=self.queue_total_var).grid(row=qrow, column=1, sticky="w")
-        ttk.Label(queue_frame, text="Pending:").grid(row=qrow, column=2, sticky="w")
-        ttk.Label(queue_frame, textvariable=self.queue_pending_var).grid(row=qrow, column=3, sticky="w")
-        qrow += 1
-
-        ttk.Label(queue_frame, text="Assigned:").grid(row=qrow, column=0, sticky="w")
-        ttk.Label(queue_frame, textvariable=self.queue_assigned_var).grid(row=qrow, column=1, sticky="w")
-        ttk.Label(queue_frame, text="Completed:").grid(row=qrow, column=2, sticky="w")
-        ttk.Label(queue_frame, textvariable=self.queue_completed_var).grid(row=qrow, column=3, sticky="w")
-        qrow += 1
-
-        ttk.Label(queue_frame, text="Failed:").grid(row=qrow, column=0, sticky="w")
-        ttk.Label(queue_frame, textvariable=self.queue_failed_var).grid(row=qrow, column=1, sticky="w")
-        qrow += 1
-
-        ttk.Button(queue_frame, text="Refresh Queue", command=self.refresh_queue_status).grid(
-            row=qrow, column=0, columnspan=2, sticky="we", pady=2
-        )
-        ttk.Button(queue_frame, text="Enqueue Output Blocks", command=self.enqueue_blocks).grid(
-            row=qrow, column=2, columnspan=2, sticky="we", pady=2
-        )
-        qrow += 1
-
-        queue_columns = ("block_id", "task", "status", "assigned_to", "updated_at")
-        self.queue_tree = ttk.Treeview(
-            queue_frame, columns=queue_columns, show="headings", height=6
-        )
-        for col in queue_columns:
-            self.queue_tree.heading(col, text=col)
-            width = 120 if col != "updated_at" else 160
-            self.queue_tree.column(col, width=width)
-        self.queue_tree.grid(row=qrow, column=0, columnspan=4, sticky="nsew")
-        queue_frame.rowconfigure(qrow, weight=1)
-        queue_frame.columnconfigure(1, weight=1)
-
-        # Live inference test
-        infer_frame = ttk.LabelFrame(bottom_frame, text="Live Model Test")
-        infer_frame.pack(side="right", fill="both", expand=True, padx=5)
-
-        self.test_persona = tk.StringVar(value="tester_npc")
-        self.test_context = tk.StringVar(value="town square")
-        self.test_state = tk.StringVar(value="idle")
-        self.test_player = tk.StringVar(value="Hello there")
-        self.test_adapter_name = tk.StringVar(value="")
-
-        ttk.Label(infer_frame, text="Adapter name:").grid(row=0, column=0, sticky="w")
-        ttk.Entry(infer_frame, textvariable=self.test_adapter_name, width=25).grid(
-            row=0, column=1, sticky="we"
-        )
-
-        ttk.Label(infer_frame, text="Persona:").grid(row=1, column=0, sticky="w")
-        ttk.Entry(infer_frame, textvariable=self.test_persona, width=25).grid(
-            row=1, column=1, sticky="we"
-        )
-
-        ttk.Label(infer_frame, text="Context:").grid(row=2, column=0, sticky="w")
-        ttk.Entry(infer_frame, textvariable=self.test_context, width=25).grid(
-            row=2, column=1, sticky="we"
-        )
-
-        ttk.Label(infer_frame, text="State:").grid(row=3, column=0, sticky="w")
-        ttk.Entry(infer_frame, textvariable=self.test_state, width=25).grid(
-            row=3, column=1, sticky="we"
-        )
-
-        ttk.Label(infer_frame, text="Player input:").grid(row=4, column=0, sticky="w")
-        ttk.Entry(infer_frame, textvariable=self.test_player, width=40).grid(
-            row=4, column=1, sticky="we"
-        )
-
-        ttk.Button(infer_frame, text="Send to Model", command=self.run_live_inference).grid(
-            row=5, column=0, columnspan=2, sticky="we", pady=4
-        )
-
-        # initial color for node status
-        self._update_node_status_style()
-
-    # Worker control -----------------------------------------------------
-    def start_worker(self):
-        if self.worker_process and self.worker_process.poll() is None:
-            messagebox.showinfo("Worker", "Worker is already running.")
-            return
-        self._log("Starting worker process...")
-        try:
-            self.worker_process = subprocess.Popen(
-                WORKER_CMD,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-            threading.Thread(target=self._stream_worker_logs, daemon=True).start()
-            self.node_status_var.set("starting")
-            self._update_node_status_style()
-        except Exception as e:
-            self._log(f"Failed to start worker: {e}")
-            messagebox.showerror("Error", f"Failed to start worker:\n{e}")
-
-    def stop_worker(self):
-        if self.worker_process and self.worker_process.poll() is None:
-            self._log("Stopping worker process...")
-            self.worker_process.terminate()
-            try:
-                self.worker_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._log("Worker did not exit, killing...")
-                self.worker_process.kill()
-            self.node_status_var.set("stopped")
-            self._update_node_status_style()
-            self._log("Worker stopped.")
-        else:
-            messagebox.showinfo("Worker", "Worker is not running.")
-
-    def _stream_worker_logs(self):
-        if not self.worker_process or not self.worker_process.stdout:
-            return
-        for line in self.worker_process.stdout:
-            if not line:
-                break
-            self.log_queue.put(line.rstrip("\n"))
-
-    # Status polling -----------------------------------------------------
-    def _poll_status_loop(self):
-        # Called periodically; fan out to all status refreshers.
-        self.refresh_status(background=True)
-        self.refresh_queue_status(background=True)
-        self.refresh_cluster_status(background=True)
-        self.after(4000, self._poll_status_loop)
-
-    def refresh_status(self, background=False):
-        def _task():
-            try:
-                url = self.trainer_url_var.get().rstrip("/") + STATUS_ENDPOINT
-                resp = requests.get(url, timeout=3)
-                resp.raise_for_status()
-                status = resp.json()
-                self._update_status_from_json(status)
-            except Exception as e:
-                if not background:
-                    messagebox.showerror("Status Error", f"Failed to fetch status:\n{e}")
-                self._log(f"Status fetch failed: {e}")
-
-        threading.Thread(target=_task, daemon=True).start()
-
-    def _update_status_from_json(self, status):
-        self.node_id_var.set(status.get("node_id", "unknown"))
-        self.node_status_var.set(status.get("state", "unknown"))
-        self._update_node_status_style()
-
-        self.base_version_var.set(str(status.get("base_model_version", "-")))
-        self.adapter_name_var.set(status.get("adapter_name", "-"))
-        self.quantization_var.set(status.get("quantization", "-"))
-        self.flash_var.set(str(status.get("use_flash_attn", False)))
-        self.compile_var.set(str(status.get("compile_model", False)))
-        self.blocks_processed_var.set(str(status.get("blocks_processed", 0)))
-
-        # Assigned blocks for this node.
-        for row in self.blocks_tree.get_children():
-            self.blocks_tree.delete(row)
-        for blk in status.get("blocks", []):
-            self.blocks_tree.insert(
-                "",
-                "end",
-                values=(
-                    blk.get("block_id", ""),
-                    blk.get("status", ""),
-                    blk.get("loss", ""),
-                    blk.get("updated_at", ""),
-                ),
-            )
-
-    def _update_node_status_style(self):
-        """Color-code the node status label by state."""
-        state = (self.node_status_var.get() or "").lower()
-        # Default colors that look okay on dark themes too
-        if state in ("idle", "ready"):
-            fg = "#7CFC00"  # bright green
-        elif state in ("training", "busy"):
-            fg = "#00BFFF"  # deep sky blue
-        elif state in ("starting", "connecting"):
-            fg = "#FFD700"  # gold
-        elif state in ("error", "failed", "disconnected"):
-            fg = "#FF4500"  # orange-red
-        elif state in ("stopped", "unknown"):
-            fg = "#AAAAAA"  # gray
-        else:
-            fg = "#FFFFFF"  # default white
-        # ttk.Label doesn't expose fg directly; use underlying style map
-        style = ttk.Style()
-        style_name = "NodeStatus.TLabel"
-        style.configure(style_name, foreground=fg)
-        self.node_status_label.configure(style=style_name)
-
-    # Queue status -------------------------------------------------------
-    def refresh_queue_status(self, background=False):
-        def _task():
-            try:
-                url = self.trainer_url_var.get().rstrip("/") + QUEUE_STATUS_ENDPOINT
-                resp = requests.get(url, timeout=5)
-                resp.raise_for_status()
-                data = resp.json()
-                self._update_queue_from_json(data)
-            except Exception as e:
-                if not background:
-                    messagebox.showerror("Queue Error", f"Failed to fetch queue status:\n{e}")
-                self._log(f"Queue status fetch failed: {e}")
-
-        threading.Thread(target=_task, daemon=True).start()
-
-    def _update_queue_from_json(self, data):
-        self.queue_total_var.set(str(data.get("total", 0)))
-        self.queue_pending_var.set(str(data.get("pending", 0)))
-        self.queue_assigned_var.set(str(data.get("assigned", 0)))
-        self.queue_completed_var.set(str(data.get("completed", 0)))
-        self.queue_failed_var.set(str(data.get("failed", 0)))
-
-        for row in self.queue_tree.get_children():
-            self.queue_tree.delete(row)
-        for blk in data.get("blocks", []):
-            self.queue_tree.insert(
-                "",
-                "end",
-                values=(
-                    blk.get("block_id", ""),
-                    blk.get("task", ""),
-                    blk.get("status", ""),
-                    blk.get("assigned_to", ""),
-                    blk.get("updated_at", ""),
-                ),
-            )
-
-    def enqueue_blocks(self):
-        """
-        Enqueue the blocks file produced by run_block_builder into the trainer's global queue.
-        Trainer-side /enqueue_blocks should accept:
-        {
-          "dataset_label": "...",
-          "blocks_path": "...",
-          "target_adapter": "optional"
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional
+
+import torch
+from datasets import Dataset, load_dataset
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    DataCollatorForLanguageModeling,
+    Trainer,
+    TrainingArguments,
+)
+from transformers.trainer_utils import get_last_checkpoint
+
+
+def _default_target_modules(model_type: str) -> List[str]:
+    mt = (model_type or "").lower()
+    if mt in {"llama", "mistral"}:
+        return ["q_proj", "v_proj"]
+    if mt in {"gpt_neox"}:
+        # Pythia / GPT-NeoX
+        return ["query_key_value"]
+    if mt in {"gpt2"}:
+        return ["c_attn", "c_proj"]
+    return []
+
+
+def _parse_target_modules(value: Optional[str]) -> Optional[List[str]]:
+    if not value:
+        return None
+    modules = [m.strip() for m in value.split(",") if m.strip()]
+    return modules or None
+
+
+def _precision_kwargs(args) -> Dict:
+    if not torch.cuda.is_available():
+        return {"torch_dtype": None}
+    # Prefer bf16 when supported and requested (LLaMA typically prefers bf16).
+    if args.bf16 and torch.cuda.is_bf16_supported():
+        return {"torch_dtype": torch.bfloat16}
+    if args.fp16:
+        return {"torch_dtype": torch.float16}
+    # Auto: use bf16 if supported, else fp16.
+    return {"torch_dtype": torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16}
+
+
+@dataclass
+class SFTExample:
+    input: str
+    target: str
+
+
+def _iter_starter_jsonl(path: Path) -> Iterable[SFTExample]:
+    for fp in sorted(path.glob("*.jsonl")):
+        with fp.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                inp = str(obj.get("input", "")).strip()
+                tgt = str(obj.get("target", "")).strip()
+                if inp and tgt:
+                    yield SFTExample(input=inp, target=tgt)
+
+
+class JsonlSFTDataset(torch.utils.data.Dataset):
+    def __init__(self, examples: List[SFTExample], tokenizer, max_length: int):
+        self.examples = examples
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self) -> int:
+        return len(self.examples)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        ex = self.examples[idx]
+        prompt = ex.input.rstrip() + "\n"
+        prompt_ids = self.tokenizer(prompt, add_special_tokens=True, truncation=True, max_length=self.max_length)
+        target_ids = self.tokenizer(ex.target, add_special_tokens=False, truncation=True, max_length=self.max_length)
+
+        input_ids = prompt_ids["input_ids"] + target_ids["input_ids"]
+        input_ids = input_ids[: self.max_length]
+        attention_mask = [1] * len(input_ids)
+
+        # Mask prompt tokens so loss only applies to the completion.
+        labels = ([-100] * len(prompt_ids["input_ids"])) + target_ids["input_ids"]
+        labels = labels[: self.max_length]
+
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
         }
-        """
-        def _task():
-            payload = {
-                "dataset_label": self.dataset_label_var.get(),
-                "blocks_path": self.output_path_var.get(),
-                "target_adapter": self.block_adapter_var.get() or None,
-            }
-            self._log(f"Enqueuing blocks to trainer: {payload}")
-            try:
-                url = self.trainer_url_var.get().rstrip("/") + ENQUEUE_BLOCKS_ENDPOINT
-                resp = requests.post(url, json=payload, timeout=10)
-                resp.raise_for_status()
-                data = resp.json()
-                msg = data.get("message", "Blocks enqueued.")
-                self._log(msg)
-                messagebox.showinfo("Enqueue Blocks", msg)
-                # Refresh queue after enqueue
-                self.refresh_queue_status(background=True)
-            except Exception as e:
-                self._log(f"Enqueue failed: {e}")
-                messagebox.showerror("Enqueue Error", f"{e}")
 
-        threading.Thread(target=_task, daemon=True).start()
 
-    # Cluster status -----------------------------------------------------
-    def refresh_cluster_status(self, background=False):
-        def _task():
-            try:
-                url = self.trainer_url_var.get().rstrip("/") + CLUSTER_STATUS_ENDPOINT
-                resp = requests.get(url, timeout=5)
-                resp.raise_for_status()
-                data = resp.json()
-                self._update_cluster_from_json(data)
-            except Exception as e:
-                if not background:
-                    messagebox.showerror("Cluster Error", f"Failed to fetch cluster status:\n{e}")
-                self._log(f"Cluster status fetch failed: {e}")
+def _collate_sft(tokenizer):
+    pad_id = tokenizer.pad_token_id
 
-        threading.Thread(target=_task, daemon=True).start()
+    def collate(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        max_len = max(int(x["input_ids"].shape[0]) for x in batch)
+        input_ids = []
+        attention_mask = []
+        labels = []
+        for item in batch:
+            ids = item["input_ids"]
+            mask = item["attention_mask"]
+            lab = item["labels"]
+            pad_len = max_len - int(ids.shape[0])
+            if pad_len:
+                ids = torch.cat([ids, torch.full((pad_len,), pad_id, dtype=torch.long)])
+                mask = torch.cat([mask, torch.zeros((pad_len,), dtype=torch.long)])
+                lab = torch.cat([lab, torch.full((pad_len,), -100, dtype=torch.long)])
+            input_ids.append(ids)
+            attention_mask.append(mask)
+            labels.append(lab)
+        return {
+            "input_ids": torch.stack(input_ids, dim=0),
+            "attention_mask": torch.stack(attention_mask, dim=0),
+            "labels": torch.stack(labels, dim=0),
+        }
 
-    def _update_cluster_from_json(self, data):
-        for row in self.cluster_tree.get_children():
-            self.cluster_tree.delete(row)
-        for node in data.get("nodes", []):
-            node_id = node.get("node_id", "")
-            state = (node.get("state", "") or "").lower()
-            blocks_completed = node.get("blocks_completed", 0)
-            trust = node.get("trust_score", 0.0)
-            last_seen = node.get("last_seen", "")
+    return collate
 
-            tags = []
 
-            # Background by state
-            if state in ("idle", "ready"):
-                tags.append("state_idle")
-            elif state in ("training", "busy"):
-                tags.append("state_training")
-            elif state in ("error", "failed", "disconnected"):
-                tags.append("state_error")
-            elif state in ("disabled", "offline"):
-                tags.append("state_disabled")
+def parse_args():
+    p = argparse.ArgumentParser(description="Train a base model or LoRA adapter.")
+    p.add_argument("--base-model", default=os.getenv("BASE_MODEL", "meta-llama/Llama-2-13b-hf"))
+    p.add_argument("--tokenizer", default=None, help="Tokenizer name/path (defaults to --base-model).")
 
-            # Foreground by trust
-            try:
-                t_val = float(trust)
-            except Exception:
-                t_val = 0.0
-            if t_val < 0.4:
-                tags.append("trust_low")
-            elif t_val < 0.7:
-                tags.append("trust_mid")
+    data = p.add_mutually_exclusive_group(required=False)
+    data.add_argument("--train-txt", default=None, help="Path to a text file for training (one document per line).")
+    data.add_argument(
+        "--starter-blocks",
+        default=None,
+        help="Directory of small JSONL files with {input,target} lines (e.g., data/starter_blocks).",
+    )
 
-            self.cluster_tree.insert(
-                "",
-                "end",
-                values=(node_id, state, blocks_completed, t_val, last_seen),
-                tags=tuple(tags),
-            )
+    p.add_argument("--val-txt", default=None, help="Optional validation text file.")
+    p.add_argument("--max-seq-len", type=int, default=512)
 
-    def _get_selected_cluster_node_id(self):
-        sel = self.cluster_tree.selection()
-        if not sel:
-            messagebox.showinfo("Cluster", "Select a node first.")
-            return None
-        item = self.cluster_tree.item(sel[0])
-        values = item.get("values", [])
-        if not values:
-            return None
-        return values[0]
+    p.add_argument("--output-dir", default="models/checkpoints", help="Trainer output_dir (checkpoints).")
+    p.add_argument("--latest-dir", default="models/latest", help="Where to write final model/tokenizer.")
+    p.add_argument("--resume-latest", action="store_true", help="Resume from the latest checkpoint in output_dir.")
 
-    def disable_selected_node(self):
-        node_id = self._get_selected_cluster_node_id()
-        if not node_id:
-            return
+    # Training hyperparameters
+    p.add_argument("--per-device-train-batch-size", type=int, default=1)
+    p.add_argument("--per-device-eval-batch-size", type=int, default=1)
+    p.add_argument("--grad-accum", type=int, default=8)
+    p.add_argument("--learning-rate", type=float, default=2e-4)
+    p.add_argument("--weight-decay", type=float, default=0.0)
+    p.add_argument("--adam-beta1", type=float, default=0.9)
+    p.add_argument("--adam-beta2", type=float, default=0.999)
+    p.add_argument("--warmup-steps", type=int, default=50)
+    p.add_argument("--lr-scheduler", default="cosine", choices=["linear", "cosine"])
+    p.add_argument("--max-grad-norm", type=float, default=1.0)
+    p.add_argument("--num-train-epochs", type=int, default=1)
+    p.add_argument("--max-steps", type=int, default=-1, help="Override epoch-based training when > 0.")
+    p.add_argument("--logging-steps", type=int, default=10)
+    p.add_argument("--save-steps", type=int, default=100)
+    p.add_argument("--eval-steps", type=int, default=200)
+    p.add_argument("--save-total-limit", type=int, default=3)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--log-to", default="none", choices=["none", "tensorboard", "wandb"])
 
-        def _task():
-            self._log(f"Disabling node {node_id}...")
-            try:
-                url = self.trainer_url_var.get().rstrip("/") + DISABLE_NODE_ENDPOINT
-                resp = requests.post(url, json={"node_id": node_id}, timeout=5)
-                resp.raise_for_status()
-                data = resp.json()
-                msg = data.get("message", f"Node {node_id} disabled.")
-                self._log(msg)
-                messagebox.showinfo("Disable Node", msg)
-                self.refresh_cluster_status(background=True)
-            except Exception as e:
-                self._log(f"Disable node failed: {e}")
-                messagebox.showerror("Disable Node Error", f"{e}")
+    # Precision
+    p.add_argument("--bf16", action="store_true", help="Prefer bf16 when supported (CUDA).")
+    p.add_argument("--fp16", action="store_true", help="Prefer fp16 on CUDA.")
 
-        threading.Thread(target=_task, daemon=True).start()
+    # LoRA / adapters
+    p.add_argument("--use-lora", action="store_true", help="Train a LoRA adapter instead of full fine-tune.")
+    p.add_argument("--adapter-name", default=None, help="Adapter name (required when --use-lora).")
+    p.add_argument("--adapter-out", default=None, help="Adapter output dir (defaults to models/adapters/<name>).")
+    p.add_argument("--manifest-path", default="data/adapters/manifest.json")
+    p.add_argument("--update-manifest", action="store_true", help="Write/overwrite manifest entry for adapter.")
+    p.add_argument("--lora-r", type=int, default=16)
+    p.add_argument("--lora-alpha", type=int, default=32)
+    p.add_argument("--lora-dropout", type=float, default=0.05)
+    p.add_argument(
+        "--lora-target-modules",
+        default=None,
+        help="Comma-separated module names. If unset, picks defaults by model type (llama/gpt_neox/gpt2).",
+    )
+    return p.parse_args()
 
-    def enable_selected_node(self):
-        node_id = self._get_selected_cluster_node_id()
-        if not node_id:
-            return
 
-        def _task():
-            self._log(f"Enabling node {node_id}...")
-            try:
-                url = self.trainer_url_var.get().rstrip("/") + ENABLE_NODE_ENDPOINT
-                resp = requests.post(url, json={"node_id": node_id}, timeout=5)
-                resp.raise_for_status()
-                data = resp.json()
-                msg = data.get("message", f"Node {node_id} enabled.")
-                self._log(msg)
-                messagebox.showinfo("Enable Node", msg)
-                self.refresh_cluster_status(background=True)
-            except Exception as e:
-                self._log(f"Enable node failed: {e}")
-                messagebox.showerror("Enable Node Error", f"{e}")
-
-        threading.Thread(target=_task, daemon=True).start()
-
-    # Starter block test -------------------------------------------------
-    def run_starter_test(self):
-        def _task():
-            self._log("Running starter-block smoke test...")
-            try:
-                url = self.trainer_url_var.get().rstrip("/") + STARTER_TEST_ENDPOINT
-                resp = requests.post(url, timeout=60)
-                resp.raise_for_status()
-                data = resp.json()
-                ok = data.get("ok", False)
-                msg = data.get("message", "no message")
-                if ok:
-                    self._log(f"Starter test OK: {msg}")
-                    messagebox.showinfo("Starter Test", f"Success:\n{msg}")
-                else:
-                    self._log(f"Starter test FAILED: {msg}")
-                    messagebox.showwarning("Starter Test", f"FAILED:\n{msg}")
-            except Exception as e:
-                self._log(f"Starter test error: {e}")
-                messagebox.showerror("Starter Test Error", f"Error:\n{e}")
-
-        threading.Thread(target=_task, daemon=True).start()
-
-    # Logging ------------------------------------------------------------
-    def _log(self, msg: str):
-        timestamp = time.strftime("%H:%M:%S")
-        self.log_queue.put(f"[{timestamp}] {msg}")
-
-    def _poll_log_queue(self):
+def _write_manifest_entry(
+    manifest_path: str,
+    adapter_name: str,
+    adapter_path: str,
+    base_model: str,
+    target_modules: List[str],
+    r: int,
+    lora_alpha: int,
+    lora_dropout: float,
+) -> None:
+    mp = Path(manifest_path)
+    mp.parent.mkdir(parents=True, exist_ok=True)
+    data = {}
+    if mp.exists():
         try:
-            while True:
-                msg = self.log_queue.get_nowait()
-                self._append_log(msg)
-        except queue.Empty:
-            pass
-        self.after(250, self._poll_log_queue)
-
-    def _append_log(self, msg: str):
-        self.log_text.configure(state="normal")
-        self.log_text.insert("end", msg + "\n")
-        self.log_text.see("end")
-        self.log_text.configure(state="disabled")
-
-    # Block builder ------------------------------------------------------
-    def run_block_builder(self):
-        def _task():
-            cmd = [
-                "python",
-                "data/make_experience_blocks.py",
-                "--input-path",
-                self.input_path_var.get(),
-                "--output",
-                self.output_path_var.get(),
-            ]
-            self._log(f"Building blocks: {' '.join(cmd)}")
-            try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-                out = proc.stdout.strip() or "Block build complete."
-                self._log(out)
-                messagebox.showinfo("Block Builder", out)
-            except subprocess.CalledProcessError as e:
-                err = e.stderr or str(e)
-                self._log(f"Block build failed: {err}")
-                messagebox.showerror("Block Build Error", err)
-
-        threading.Thread(target=_task, daemon=True).start()
-
-    # Live inference -----------------------------------------------------
-    def run_live_inference(self):
-        def _task():
-            payload = {
-                "persona": self.test_persona.get(),
-                "context": self.test_context.get(),
-                "state": self.test_state.get(),
-                "player_input": self.test_player.get(),
-            }
-            if self.test_adapter_name.get():
-                payload["adapter_name"] = self.test_adapter_name.get()
-            try:
-                url = self.inference_url_var.get().rstrip("/")
-                resp = requests.post(url, json=payload, timeout=20)
-                resp.raise_for_status()
-                data = resp.json()
-                self._log(f"Inference response: {data}")
-            except Exception as e:
-                self._log(f"Inference error: {e}")
-                messagebox.showerror("Inference Error", f"{e}")
-
-        threading.Thread(target=_task, daemon=True).start()
+            data = json.loads(mp.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data[adapter_name] = {
+        "name": adapter_name,
+        "adapter_path": adapter_path,
+        "base_model": base_model,
+        "target_modules": target_modules,
+        "r": r,
+        "lora_alpha": lora_alpha,
+        "lora_dropout": lora_dropout,
+        "version": data.get(adapter_name, {}).get("version", "0.1.0"),
+    }
+    mp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def main():
-    app = CommandStation()
-    app.mainloop()
+    args = parse_args()
+
+    base_model = args.base_model
+    tokenizer_name = args.tokenizer or base_model
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    precision = _precision_kwargs(args)
+    model = AutoModelForCausalLM.from_pretrained(base_model, trust_remote_code=True, **precision)
+
+    data_collator = None
+    train_dataset = None
+    eval_dataset = None
+
+    if args.starter_blocks:
+        examples = list(_iter_starter_jsonl(Path(args.starter_blocks)))
+        if not examples:
+            raise SystemExit(f"No SFT examples found under {args.starter_blocks}")
+        # tiny split if no eval provided
+        split = max(1, int(len(examples) * 0.95))
+        train_dataset = JsonlSFTDataset(examples[:split], tokenizer, max_length=args.max_seq_len)
+        eval_dataset = JsonlSFTDataset(examples[split:], tokenizer, max_length=args.max_seq_len) if split < len(examples) else None
+        data_collator = _collate_sft(tokenizer)
+    else:
+        if not args.train_txt:
+            raise SystemExit("Provide --train-txt or --starter-blocks")
+        files = {"train": args.train_txt}
+        if args.val_txt:
+            files["validation"] = args.val_txt
+        raw = load_dataset("text", data_files=files)
+
+        def tokenize_function(examples):
+            return tokenizer(examples["text"], truncation=True, max_length=args.max_seq_len)
+
+        tokenized = raw.map(tokenize_function, batched=True, remove_columns=["text"])
+        train_dataset = tokenized["train"]
+        eval_dataset = tokenized.get("validation")
+        data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+    adapter_out = None
+    if args.use_lora:
+        if not args.adapter_name:
+            raise SystemExit("--adapter-name is required when --use-lora")
+        try:
+            from peft import LoraConfig, get_peft_model
+        except ImportError as exc:
+            raise SystemExit("peft is required for --use-lora") from exc
+        target_modules = _parse_target_modules(args.lora_target_modules)
+        if target_modules is None:
+            target_modules = _default_target_modules(getattr(model.config, "model_type", ""))
+        if not target_modules:
+            raise SystemExit(
+                "Unable to infer --lora-target-modules for this model; pass --lora-target-modules explicitly."
+            )
+        lora_cfg = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=target_modules,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_cfg)
+        model.print_trainable_parameters()
+
+        adapter_out = args.adapter_out or str(Path("models/adapters") / args.adapter_name)
+        Path(adapter_out).mkdir(parents=True, exist_ok=True)
+
+        if args.update_manifest:
+            _write_manifest_entry(
+                manifest_path=args.manifest_path,
+                adapter_name=args.adapter_name,
+                adapter_path=adapter_out,
+                base_model=base_model,
+                target_modules=target_modules,
+                r=args.lora_r,
+                lora_alpha=args.lora_alpha,
+                lora_dropout=args.lora_dropout,
+            )
+
+    # TrainingArguments
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    resume_from = None
+    if args.resume_latest:
+        last_ckpt = get_last_checkpoint(str(output_dir))
+        if last_ckpt:
+            resume_from = last_ckpt
+
+    # Auto mixed precision flags
+    use_bf16 = bool(torch.cuda.is_available() and args.bf16 and torch.cuda.is_bf16_supported())
+    use_fp16 = bool(torch.cuda.is_available() and (args.fp16 or (not args.bf16 and not use_bf16)))
+
+    training_args = TrainingArguments(
+        output_dir=str(output_dir),
+        overwrite_output_dir=True,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        per_device_eval_batch_size=args.per_device_eval_batch_size,
+        gradient_accumulation_steps=args.grad_accum,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        adam_beta1=args.adam_beta1,
+        adam_beta2=args.adam_beta2,
+        warmup_steps=args.warmup_steps,
+        lr_scheduler_type=args.lr_scheduler,
+        max_grad_norm=args.max_grad_norm,
+        num_train_epochs=args.num_train_epochs,
+        max_steps=args.max_steps,
+        logging_steps=args.logging_steps,
+        save_steps=args.save_steps,
+        eval_steps=args.eval_steps,
+        evaluation_strategy="steps" if eval_dataset is not None else "no",
+        save_total_limit=args.save_total_limit,
+        report_to=None if args.log_to == "none" else args.log_to,
+        seed=args.seed,
+        fp16=use_fp16,
+        bf16=use_bf16,
+        dataloader_pin_memory=torch.cuda.is_available(),
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        data_collator=data_collator,
+        tokenizer=tokenizer,
+    )
+
+    trainer.train(resume_from_checkpoint=resume_from)
+
+    # Save outputs
+    if args.use_lora:
+        assert adapter_out is not None
+        model.save_pretrained(adapter_out)
+        tokenizer.save_pretrained(adapter_out)
+        print(f"Saved adapter to {adapter_out}")
+    else:
+        latest_dir = Path(args.latest_dir)
+        latest_dir.mkdir(parents=True, exist_ok=True)
+        trainer.save_model(str(latest_dir))
+        tokenizer.save_pretrained(str(latest_dir))
+        print(f"Saved model to {latest_dir}")
 
 
 if __name__ == "__main__":
     main()
+

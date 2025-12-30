@@ -43,5 +43,20 @@
     "audience": "teen",
     "description": "Hindu lore/style adapter for sages/temple guardians/yogis.",
     "tags": ["npc", "religion", "hindu"]
+  },
+  "npc_core_pythia_410m_v1": {
+    "name": "npc_core_pythia_410m_v1",
+    "adapter_path": "models/adapters/npc_core_pythia_410m_v1",
+    "base_model": "EleutherAI/pythia-410m-deduped",
+    "target_modules": ["query_key_value"],
+    "r": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05,
+    "version": "0.1.0",
+    "hf_repo_id": "your-org/npc_core_pythia_410m_v1",
+    "task": "npc_general",
+    "audience": "general",
+    "description": "General NPC adapter for the open Pythia-410M baseline (good for quick iteration).",
+    "tags": ["npc", "core", "pythia", "410m"]
   }
 }

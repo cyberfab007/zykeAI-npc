@@ -34,7 +34,7 @@ def load_model_with_adapter(
     compile_model: bool = False,
 ):
     """
-    Load a GPT-2 model and tokenizer, optionally applying a PEFT adapter and quantization.
+    Load a Hugging Face causal LM and tokenizer, optionally applying a PEFT adapter and quantization.
     Results are cached by (base_model, adapter_path, quantization, tokenizer_path, use_flash_attn, compile_model).
     """
     if adapter_name and not adapter_path:
