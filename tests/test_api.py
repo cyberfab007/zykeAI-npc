@@ -12,11 +12,16 @@ from deployment.app import app  # noqa: E402
 @pytest.fixture
 def client(monkeypatch):
     # Stub generate_npc_response to avoid heavy model load
+    captured = {}
+
     def fake_generate(**kwargs):
+        captured.update(kwargs)
         return {"say": "hi", "action": "idle", "emotion": "neutral"}
 
-    monkeypatch.setattr("deployment.app.generate_npc_response", lambda **kwargs: fake_generate(**kwargs))
-    return app.test_client()
+    monkeypatch.setattr("deployment.app.generate_npc_response", fake_generate)
+    c = app.test_client()
+    c.captured_generate_kwargs = captured
+    return c
 
 
 def test_health(client):
@@ -31,13 +36,15 @@ def test_generate_single(client):
         "context": "unit test",
         "state": "ok",
         "player_input": "hello",
-        "adapter_name": None,
+        "adapter_name": "npc_core_pythia_410m_v1",
+        "adapter_version": 123,
     }
     resp = client.post("/generate", data=json.dumps(payload), content_type="application/json")
     assert resp.status_code == 200
     data = resp.get_json()
     assert "result" in data
     assert data["result"]["say"] == "hi"
+    assert client.captured_generate_kwargs.get("cache_tag") == "npc_core_pythia_410m_v1:123"
 
 
 def test_generate_batch(client):
