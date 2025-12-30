@@ -215,6 +215,7 @@ API_TOKEN=yourtoken python deployment/app.py
 `/generate` supports:
 - `adapter_name` (preferred; resolved via `data/adapters/manifest.json`)
 - `adapter_version` (optional cache-buster; use this when you update adapter weights on disk and want inference to reload)
+ - MCP tools (optional): set `enable_tools=true` and pass `npc_type` so the server can allowlist tools from `data/mcp/tools.json`
 
 ### Distributed delta loop (trainer + workers)
 
@@ -260,6 +261,17 @@ The GUI can:
 - Build blocks locally and enqueue them to the trainer
 - Stream trainer logs live from `GET /events`
 - Chat with the inference API; optionally calls `POST /export_adapter` on the trainer first and passes `adapter_version` to force inference reload
+- (Optional) Tool-use planning: set `enable_tools` in your `/generate` payload and run a local MCP tool server (see below)
+
+### MCP Tool Server (optional, for metaverse/game integration)
+
+Run the local stub server (replace tool handlers with real game state later):
+
+```bash
+python -m src.mcp.server_stub
+```
+
+Tool manifest lives at `data/mcp/tools.json`. Add/allowlist tools by `npc_type` (e.g., `dog_guard`).
 
 ### Adapter manifest + publish
 

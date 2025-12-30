@@ -38,6 +38,8 @@ def test_generate_single(client):
         "player_input": "hello",
         "adapter_name": "npc_core_pythia_410m_v1",
         "adapter_version": 123,
+        "enable_tools": True,
+        "npc_type": "dog_guard",
     }
     resp = client.post("/generate", data=json.dumps(payload), content_type="application/json")
     assert resp.status_code == 200
@@ -45,6 +47,8 @@ def test_generate_single(client):
     assert "result" in data
     assert data["result"]["say"] == "hi"
     assert client.captured_generate_kwargs.get("cache_tag") == "npc_core_pythia_410m_v1:123"
+    assert client.captured_generate_kwargs.get("enable_tools") is True
+    assert client.captured_generate_kwargs.get("npc_type") == "dog_guard"
 
 
 def test_generate_batch(client):

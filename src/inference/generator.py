@@ -5,6 +5,8 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.models.adapter import load_model_with_adapter
+from src.mcp.client import call_tool
+from src.mcp.registry import allowed_tools
 
 
 ALLOWED_ACTIONS = [
@@ -44,6 +46,13 @@ REFUSAL = {
     "thoughts": "Refused unsafe content.",
 }
 
+DEFAULT_TOOL_SYSTEM = (
+    "You may optionally request tool calls to help decide your response.\n"
+    "If you request tools, respond ONLY with JSON of the form:\n"
+    '{ "tool_calls": [ { "name": "<tool>", "arguments": { ... } } ] }\n'
+    "After tools run, you will be asked again to produce the final NPC JSON response.\n"
+)
+
 
 def build_npc_prompt(persona: str, context: str, state: str, player_input: str) -> str:
     system = (
@@ -53,6 +62,31 @@ def build_npc_prompt(persona: str, context: str, state: str, player_input: str) 
         '  "emotion": "one of: neutral, happy, angry, afraid, sad, curious",\n'
         '  "thoughts": "private reasoning, optional"\n}\n'
         "Do not add extra text before or after the JSON."
+    )
+    parts = [
+        system,
+        f"Persona: {persona}",
+        f"Context: {context}",
+        f"State: {state}",
+        f"Player: {player_input}",
+        "NPC:",
+    ]
+    return "\n".join(parts)
+
+
+def build_npc_prompt_with_tools(
+    persona: str,
+    context: str,
+    state: str,
+    player_input: str,
+    tool_names: List[str],
+) -> str:
+    tool_list = ", ".join(tool_names) if tool_names else "(none)"
+    system = (
+        "You are an NPC. Stay in character.\n"
+        "You must respond with JSON.\n"
+        f"Allowed tools: {tool_list}\n\n"
+        + DEFAULT_TOOL_SYSTEM
     )
     parts = [
         system,
@@ -84,6 +118,29 @@ def parse_npc_output(raw_text: str) -> Dict[str, str]:
         return {"say": say, "action": action, "emotion": emotion, "thoughts": thoughts}
     except Exception:
         return fallback
+
+
+def _parse_tool_calls(raw_text: str) -> List[Dict[str, object]]:
+    start = raw_text.find("{")
+    end = raw_text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return []
+    try:
+        parsed = json.loads(raw_text[start : end + 1])
+        calls = parsed.get("tool_calls")
+        if not isinstance(calls, list):
+            return []
+        out = []
+        for c in calls:
+            if not isinstance(c, dict):
+                continue
+            name = c.get("name")
+            args = c.get("arguments", {})
+            if isinstance(name, str) and isinstance(args, dict):
+                out.append({"name": name, "arguments": args})
+        return out
+    except Exception:
+        return []
 
 
 def generate_text(model_path, tokenizer_path, prompt, max_length=100):
@@ -157,8 +214,21 @@ def generate_npc_response(
     use_flash_attn: bool = False,
     compile_model: bool = False,
     cache_tag: Optional[str] = None,
+    enable_tools: bool = False,
+    npc_type: str = "generic",
+    audience: str = "adult",
+    tool_manifest_path: str = "data/mcp/tools.json",
+    mcp_timeout_sec: float = 5.0,
+    max_tool_calls: int = 2,
 ) -> Dict[str, str]:
-    prompt = build_npc_prompt(persona, context, state, player_input)
+    # Tool-augmented mode: allow the model to request tools, then re-ask for final JSON.
+    tool_results = []
+    tool_names = []
+    if enable_tools:
+        allowed = allowed_tools(manifest_path=tool_manifest_path, npc_type=npc_type, audience=audience)
+        tool_names = sorted(list(allowed.keys()))
+        tool_prompt = build_npc_prompt_with_tools(persona, context, state, player_input, tool_names=tool_names)
+    prompt = build_npc_prompt(persona, context, state, player_input) if not enable_tools else tool_prompt
     model, tokenizer, device = load_model_with_adapter(
         base_model=base_model,
         tokenizer_path=tokenizer_path,
@@ -174,6 +244,35 @@ def generate_npc_response(
         prompt, return_tensors="pt", truncation=True, max_length=512
     ).to(device)
     bad_words_ids = _bad_words_ids(tokenizer, BAD_WORDS) if safe_mode else None
+
+    if enable_tools and tool_names:
+        with torch.no_grad():
+            output = model.generate(
+                **inputs,
+                max_new_tokens=160,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.9,
+                pad_token_id=tokenizer.eos_token_id,
+                bad_words_ids=bad_words_ids,
+            )
+        raw = tokenizer.decode(output[0], skip_special_tokens=True)
+        calls = _parse_tool_calls(raw)[: max(0, int(max_tool_calls))]
+        allowed = allowed_tools(manifest_path=tool_manifest_path, npc_type=npc_type, audience=audience)
+        for call in calls:
+            name = str(call["name"])
+            if name not in allowed:
+                continue
+            try:
+                res = call_tool(allowed[name], args=dict(call["arguments"]), manifest_path=tool_manifest_path, timeout_sec=mcp_timeout_sec)
+                tool_results.append({"name": name, "ok": True, "result": res.get("result", res)})
+            except Exception as exc:
+                tool_results.append({"name": name, "ok": False, "error": str(exc)})
+
+        if tool_results:
+            tool_context = json.dumps({"tool_results": tool_results}, ensure_ascii=False)
+            prompt = build_npc_prompt(persona, context + "\n\nTool results:\n" + tool_context, state, player_input)
+            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(device)
 
     # If schema enforcement is off (adult profile), return the first pass raw parse without retries.
     if not enforce_schema:
@@ -191,7 +290,7 @@ def generate_npc_response(
             )
         raw = tokenizer.decode(output[0], skip_special_tokens=True)
         parsed = parse_npc_output(raw)
-        return (parsed, {"final_outcome": "success", "npc_json_valid": True}) if return_stats else parsed
+        return (parsed, {"final_outcome": "success", "npc_json_valid": True, "tool_results": tool_results}) if return_stats else parsed
 
     stats = {
         "npc_json_valid": False,
@@ -205,6 +304,7 @@ def generate_npc_response(
         "initial_top_p": top_p,
         "final_temperature": None,
         "final_top_p": None,
+        "tool_results": tool_results,
     }
 
     for attempt in range(max_retries + 1):

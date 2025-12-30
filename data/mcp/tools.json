@@ -1,0 +1,61 @@
+{
+  "version": "0.1.0",
+  "servers": {
+    "game_state_local": {
+      "base_url": "http://localhost:7000",
+      "auth": {
+        "type": "bearer_env",
+        "env_var": "MCP_API_TOKEN"
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "game.get_nearby_entities",
+      "description": "Return nearby entities around the player/NPC with coarse threat info.",
+      "server": "game_state_local",
+      "allowed_npc_types": ["dog_guard", "guard", "combat"],
+      "allowed_audiences": ["adult", "minor"],
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "radius_m": { "type": "number", "minimum": 1, "maximum": 200 },
+          "max_results": { "type": "integer", "minimum": 1, "maximum": 100 }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "game.get_player_status",
+      "description": "Return health/state flags for a player id.",
+      "server": "game_state_local",
+      "allowed_npc_types": ["dog_guard", "companion"],
+      "allowed_audiences": ["adult", "minor"],
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "player_id": { "type": "string" }
+        },
+        "required": ["player_id"]
+      }
+    },
+    {
+      "name": "game.command",
+      "description": "Request an in-game command (move/guard/attack/follow). The game server decides if it is allowed.",
+      "server": "game_state_local",
+      "allowed_npc_types": ["dog_guard", "companion"],
+      "allowed_audiences": ["adult", "minor"],
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "action": { "type": "string" },
+          "target_id": { "type": ["string", "null"] },
+          "x": { "type": ["number", "null"] },
+          "y": { "type": ["number", "null"] }
+        },
+        "required": ["action"]
+      }
+    }
+  ]
+}
+

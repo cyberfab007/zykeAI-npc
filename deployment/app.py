@@ -164,6 +164,7 @@ def _handle_single_request(body: dict):
         raise ValueError(f"Missing fields: {', '.join(missing)}")
 
     audience = (body.get("audience") or "minor").lower()
+    npc_type = body.get("npc_type", "generic")
     base_model = body.get("base_model", DEFAULT_BASE_MODEL)
     tokenizer_path = body.get("tokenizer_path", DEFAULT_TOKENIZER_PATH)
     adapter_path = body.get("adapter_path")  # optional
@@ -186,6 +187,10 @@ def _handle_single_request(body: dict):
     num_beams = int(num_beams) if num_beams is not None else None
     use_flash_attn = bool(body.get("use_flash_attn", False))
     compile_model = bool(body.get("compile_model", False))
+    enable_tools = bool(body.get("enable_tools", False))
+    tool_manifest_path = body.get("tool_manifest_path", "data/mcp/tools.json")
+    mcp_timeout_sec = float(body.get("mcp_timeout_sec", 5.0))
+    max_tool_calls = int(body.get("max_tool_calls", 2))
 
     def task():
         return generate_npc_response(
@@ -209,6 +214,12 @@ def _handle_single_request(body: dict):
             use_flash_attn=use_flash_attn,
             compile_model=compile_model,
             cache_tag=f"{adapter_name}:{adapter_version}" if (adapter_name and adapter_version is not None) else None,
+            enable_tools=enable_tools,
+            npc_type=npc_type,
+            audience=audience,
+            tool_manifest_path=tool_manifest_path,
+            mcp_timeout_sec=mcp_timeout_sec,
+            max_tool_calls=max_tool_calls,
         )
 
     try:
