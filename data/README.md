@@ -12,7 +12,7 @@ Example:
 python data/make_experience_blocks.py \
   --input-path data/raw/ebooks \
   --output data/processed/experience_blocks.jsonl \
-  --tokenizer meta-llama/Llama-2-13b-hf \
+  --tokenizer EleutherAI/pythia-410m-deduped \
   --seq-len 128 \
   --steps-per-block 64 \
   --env-id ebooks \

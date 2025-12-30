@@ -63,6 +63,10 @@ Notes:
     - `/get_lora_weights` (b64 `torch.save` of trainable state for `model_version`)
     - `/get_block?block_id=...` (returns the queued experience block JSON so workers can train on it)
     - `/submit_update` (accepts b64 delta, `num_samples`, optional `block_id`/`block_hash`, and metrics)
+    - `/node_heartbeat` (workers POST {node_id,state,capabilities}; drives cluster status and disable enforcement)
+    - `/cluster_status` (returns nodes from SQLite; supports enable/disable)
+    - `/events` (SSE stream of trainer events/logs; used by the Command Station GUI)
+    - `/export_adapter` (LLM backend only; writes current LoRA weights to the adapter dir so inference can pick it up)
   - Aggregation: buckets per `base_model_version`, weighted by `num_samples`; triggers on `NUM_TASKS_PER_ROUND` or `ROUND_TIMEOUT_SEC` with `MIN_UPDATES_PER_ROUND`; rejects staleness beyond `MAX_STALENESS`.
   - Safety: rejects bad shapes, NaN/inf metrics, explosive delta L2 (> `DELTA_NORM_MAX`); ticker thread applies timeout aggregations and saves checkpoints.
   - Backends:
@@ -70,6 +74,9 @@ Notes:
     - `TRAINER_BACKEND=llm`: LoRA-on-LLM delta trainer using `LLM_ADAPTER_NAME` from `data/adapters/manifest.json` (recommended to start with `EleutherAI/pythia-410m-deduped`).
       - Checkpoints are LoRA-only: `models/checkpoints/lora_v{version}.pt` (no full base weights).
       - Workers run with `--mode llm` and train on queued experience blocks (token IDs must match the tokenizer used to build the blocks).
+  - Persistence:
+    - Queue/nodes/history are stored in SQLite (default `TRAINER_DB_PATH=models/trainer.db`) so restarts don’t wipe state.
+    - Block claiming uses a DB transaction to avoid duplicate assignment.
 
 ---
 
