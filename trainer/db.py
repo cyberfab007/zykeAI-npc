@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -37,6 +38,58 @@ def init_db(db_path: str) -> None:
                     updated_at TEXT,
                     block_json TEXT
                 );
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS block_meta (
+                    block_id TEXT PRIMARY KEY,
+                    required_replicas INTEGER,
+                    best_k INTEGER,
+                    decided INTEGER,
+                    created_at TEXT
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS assignments (
+                    assignment_id TEXT PRIMARY KEY,
+                    block_id TEXT,
+                    node_id TEXT,
+                    status TEXT,
+                    created_at TEXT,
+                    updated_at TEXT
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_assignments_block_status
+                ON assignments(block_id, status);
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS submissions (
+                    submission_id TEXT PRIMARY KEY,
+                    assignment_id TEXT,
+                    block_id TEXT,
+                    node_id TEXT,
+                    base_version INTEGER,
+                    num_samples INTEGER,
+                    delta_b64 TEXT,
+                    metrics_json TEXT,
+                    score REAL,
+                    selected INTEGER,
+                    created_at TEXT
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_submissions_block
+                ON submissions(block_id);
                 """
             )
             cur.execute(
@@ -174,6 +227,8 @@ def enqueue_blocks(
     dataset_label: str,
     target_adapter: Optional[str],
     updated_at: str,
+    required_replicas: int = 1,
+    best_k: int = 1,
 ) -> int:
     added = 0
     with _db_lock:
@@ -199,6 +254,14 @@ def enqueue_blocks(
                         updated_at,
                         json.dumps(obj),
                     ),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO block_meta(block_id, required_replicas, best_k, decided, created_at)
+                    VALUES(?, ?, ?, COALESCE((SELECT decided FROM block_meta WHERE block_id=?), 0),
+                           COALESCE((SELECT created_at FROM block_meta WHERE block_id=?), ?))
+                    """,
+                    (block_id, int(required_replicas), int(best_k), block_id, block_id, updated_at),
                 )
                 added += 1
             conn.commit()
@@ -232,7 +295,18 @@ def list_recent_blocks(db_path: str, limit: int = 50) -> List[Dict[str, Any]]:
         conn = _connect(db_path)
         try:
             cur = conn.execute(
-                "SELECT block_id, task, target_adapter, status, hash, assigned_to, updated_at FROM blocks ORDER BY updated_at DESC LIMIT ?",
+                """
+                SELECT
+                    b.block_id, b.task, b.target_adapter, b.status, b.hash, b.assigned_to, b.updated_at,
+                    COALESCE(m.required_replicas, 1) AS required_replicas,
+                    COALESCE(m.best_k, 1) AS best_k,
+                    COALESCE(m.decided, 0) AS decided,
+                    (SELECT COUNT(*) FROM submissions s WHERE s.block_id=b.block_id) AS submissions_count
+                FROM blocks b
+                LEFT JOIN block_meta m ON m.block_id=b.block_id
+                ORDER BY b.updated_at DESC
+                LIMIT ?
+                """,
                 (int(limit),),
             )
             return [dict(r) for r in cur.fetchall()]
@@ -246,33 +320,202 @@ def claim_next_block(db_path: str, node_id: str, updated_at: str) -> Optional[Di
         try:
             conn.execute("BEGIN IMMEDIATE;")
             cur = conn.execute(
-                "SELECT block_id FROM blocks WHERE status='pending' ORDER BY updated_at ASC LIMIT 1"
+                """
+                SELECT b.block_id
+                FROM blocks b
+                LEFT JOIN block_meta m ON m.block_id=b.block_id
+                WHERE
+                    COALESCE(m.decided, 0) = 0
+                    AND b.status IN ('pending', 'assigned')
+                    AND (
+                        (SELECT COUNT(*) FROM assignments a WHERE a.block_id=b.block_id AND a.status IN ('assigned', 'completed'))
+                        < COALESCE(m.required_replicas, 1)
+                    )
+                ORDER BY b.updated_at ASC
+                LIMIT 1
+                """
             )
             row = cur.fetchone()
             if row is None:
                 conn.execute("COMMIT;")
                 return None
             block_id = row["block_id"]
-            cur2 = conn.execute(
-                "UPDATE blocks SET status='assigned', assigned_to=?, updated_at=? WHERE block_id=? AND status='pending'",
+            assignment_id = str(uuid.uuid4())
+            conn.execute(
+                "INSERT INTO assignments(assignment_id, block_id, node_id, status, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?)",
+                (assignment_id, block_id, node_id, "assigned", updated_at, updated_at),
+            )
+            # Mark the block as assigned/in-progress.
+            conn.execute(
+                "UPDATE blocks SET status='assigned', assigned_to=?, updated_at=? WHERE block_id=?",
                 (node_id, updated_at, block_id),
             )
-            if cur2.rowcount != 1:
-                conn.execute("COMMIT;")
-                return None
             cur3 = conn.execute(
-                "SELECT block_id, task, target_adapter, status, hash, assigned_to, updated_at FROM blocks WHERE block_id=?",
+                """
+                SELECT b.block_id, b.task, b.target_adapter, b.status, b.hash, b.assigned_to, b.updated_at,
+                       COALESCE(m.required_replicas, 1) AS required_replicas,
+                       COALESCE(m.best_k, 1) AS best_k,
+                       COALESCE(m.decided, 0) AS decided
+                FROM blocks b
+                LEFT JOIN block_meta m ON m.block_id=b.block_id
+                WHERE b.block_id=?
+                """,
                 (block_id,),
             )
             conn.execute("COMMIT;")
             rec = cur3.fetchone()
-            return dict(rec) if rec else None
+            if not rec:
+                return None
+            d = dict(rec)
+            d["assignment_id"] = assignment_id
+            # include current submission count for convenience
+            cur4 = conn.execute("SELECT COUNT(*) AS c FROM submissions WHERE block_id=?", (block_id,))
+            d["submissions_count"] = int(cur4.fetchone()["c"])
+            return d
         except Exception:
             try:
                 conn.execute("ROLLBACK;")
             except Exception:
                 pass
             raise
+        finally:
+            conn.close()
+
+
+def get_assignment(db_path: str, assignment_id: str) -> Optional[Dict[str, Any]]:
+    with _db_lock:
+        conn = _connect(db_path)
+        try:
+            cur = conn.execute("SELECT * FROM assignments WHERE assignment_id=?", (assignment_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+
+def mark_assignment_status(db_path: str, assignment_id: str, status: str, updated_at: str) -> None:
+    with _db_lock:
+        conn = _connect(db_path)
+        try:
+            conn.execute(
+                "UPDATE assignments SET status=?, updated_at=? WHERE assignment_id=?",
+                (status, updated_at, assignment_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def record_submission(
+    db_path: str,
+    assignment_id: str,
+    block_id: str,
+    node_id: str,
+    base_version: int,
+    num_samples: int,
+    delta_b64: str,
+    metrics: Dict[str, Any],
+    score: float,
+    selected: bool,
+    created_at: str,
+) -> str:
+    submission_id = str(uuid.uuid4())
+    with _db_lock:
+        conn = _connect(db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO submissions(
+                    submission_id, assignment_id, block_id, node_id, base_version, num_samples, delta_b64,
+                    metrics_json, score, selected, created_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    submission_id,
+                    assignment_id,
+                    block_id,
+                    node_id,
+                    int(base_version),
+                    int(num_samples),
+                    delta_b64,
+                    json.dumps(metrics or {}, sort_keys=True),
+                    float(score),
+                    1 if selected else 0,
+                    created_at,
+                ),
+            )
+            conn.commit()
+            return submission_id
+        finally:
+            conn.close()
+
+
+def block_submission_count(db_path: str, block_id: str) -> int:
+    with _db_lock:
+        conn = _connect(db_path)
+        try:
+            cur = conn.execute("SELECT COUNT(*) AS c FROM submissions WHERE block_id=?", (block_id,))
+            return int(cur.fetchone()["c"])
+        finally:
+            conn.close()
+
+
+def get_block_meta(db_path: str, block_id: str) -> Optional[Dict[str, Any]]:
+    with _db_lock:
+        conn = _connect(db_path)
+        try:
+            cur = conn.execute("SELECT * FROM block_meta WHERE block_id=?", (block_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+
+def set_block_decided(db_path: str, block_id: str, decided: bool, status: str, updated_at: str) -> None:
+    with _db_lock:
+        conn = _connect(db_path)
+        try:
+            conn.execute("UPDATE block_meta SET decided=? WHERE block_id=?", (1 if decided else 0, block_id))
+            conn.execute("UPDATE blocks SET status=?, updated_at=? WHERE block_id=?", (status, updated_at, block_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def list_block_submissions(db_path: str, block_id: str) -> List[Dict[str, Any]]:
+    with _db_lock:
+        conn = _connect(db_path)
+        try:
+            cur = conn.execute(
+                "SELECT submission_id, assignment_id, block_id, node_id, base_version, num_samples, delta_b64, metrics_json, score, selected, created_at "
+                "FROM submissions WHERE block_id=?",
+                (block_id,),
+            )
+            out = []
+            for r in cur.fetchall():
+                d = dict(r)
+                try:
+                    d["metrics"] = json.loads(d.get("metrics_json") or "{}")
+                except Exception:
+                    d["metrics"] = {}
+                d.pop("metrics_json", None)
+                d["selected"] = bool(d.get("selected"))
+                out.append(d)
+            return out
+        finally:
+            conn.close()
+
+
+def set_selected_submissions(db_path: str, submission_ids: List[str], selected: bool) -> None:
+    if not submission_ids:
+        return
+    with _db_lock:
+        conn = _connect(db_path)
+        try:
+            q = ",".join(["?"] * len(submission_ids))
+            conn.execute(f"UPDATE submissions SET selected=? WHERE submission_id IN ({q})", (1 if selected else 0, *submission_ids))
+            conn.commit()
         finally:
             conn.close()
 

@@ -68,6 +68,10 @@ Notes:
     - `/events` (SSE stream of trainer events/logs; used by the Command Station GUI)
     - `/export_adapter` (LLM backend only; writes current LoRA weights to the adapter dir so inference can pick it up)
   - Aggregation: buckets per `base_model_version`, weighted by `num_samples`; triggers on `NUM_TASKS_PER_ROUND` or `ROUND_TIMEOUT_SEC` with `MIN_UPDATES_PER_ROUND`; rejects staleness beyond `MAX_STALENESS`.
+  - Replicated blocks (recommended for untrusted workers):
+    - Configure `REPLICAS_PER_BLOCK=5` to assign the same block to multiple workers.
+    - Configure `BEST_K_PER_BLOCK=1` (or 2–3) to pick the best submissions for that block.
+    - The trainer waits until it has `REPLICAS_PER_BLOCK` submissions for a `block_id`, selects winners, and then submits **one** aggregated delta into the round aggregator.
   - Safety: rejects bad shapes, NaN/inf metrics, explosive delta L2 (> `DELTA_NORM_MAX`); ticker thread applies timeout aggregations and saves checkpoints.
   - Backends:
     - `TRAINER_BACKEND=mlp` (default): demo MLPPolicy trainer (fast infra smoke tests).

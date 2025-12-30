@@ -207,6 +207,7 @@ def train_one_task_mlp(task: Dict, trainer_url: str, args) -> Dict:
         "num_samples": steps_done * batch_size,
         "lora_delta": delta_b64,
         "metrics": metrics,
+        "assignment_id": task.get("assignment_id"),
         "block_id": task.get("block_id"),
         "block_hash": task.get("block_hash"),
     }
@@ -333,6 +334,7 @@ def train_one_task_llm(task: Dict, trainer_url: str, args) -> Dict:
         "num_samples": steps_done * batch_size,
         "lora_delta": delta_b64,
         "metrics": metrics,
+        "assignment_id": task.get("assignment_id"),
         "block_id": block_id,
         "block_hash": task.get("block_hash"),
     }

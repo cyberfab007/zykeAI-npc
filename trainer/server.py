@@ -23,15 +23,22 @@ from trainer.db import (
     append_history,
     claim_next_block,
     enqueue_blocks as db_enqueue_blocks,
+    get_assignment,
     get_block as db_get_block,
+    get_block_meta,
     get_node,
     increment_node_blocks_completed,
     init_db,
     list_nodes,
+    list_block_submissions,
     list_recent_blocks,
     mark_block_status,
+    mark_assignment_status,
     queue_counts,
     recent_history,
+    record_submission,
+    set_block_decided,
+    set_selected_submissions,
     set_node_enabled,
     upsert_node,
 )
@@ -53,6 +60,8 @@ MIN_DELTA_NORM = float(os.getenv("MIN_DELTA_NORM", "1e-8"))
 TRIM_FRAC = float(os.getenv("TRIM_FRAC", "0.1"))
 REQUIRE_BLOCK_HASH = os.getenv("REQUIRE_BLOCK_HASH", "false").lower() == "true"
 BLOCK_HASH_MAP = os.getenv("BLOCK_HASH_MAP")  # path to block_id->hash mapping (JSON)
+REPLICAS_PER_BLOCK = int(os.getenv("REPLICAS_PER_BLOCK", "5"))
+BEST_K_PER_BLOCK = int(os.getenv("BEST_K_PER_BLOCK", "1"))
 
 app = Flask(__name__)
 
@@ -103,6 +112,103 @@ def validate_delta(delta_state: Dict[str, torch.Tensor], global_state: Dict[str,
         if v.shape != global_state[k].shape:
             return False
     return True
+
+
+def _score_mlp_delta(delta_state: Dict[str, torch.Tensor]) -> float:
+    """
+    Cheap server-side scoring for MLP backend:
+    score = loss_before - loss_after on a fixed synthetic batch.
+    """
+    device = torch.device("cpu")
+    obs_dim = 128
+    action_dim = 32
+
+    def eval_with_state(trainable_state: Dict[str, torch.Tensor]) -> float:
+        tmp = MLPPolicy(obs_dim=obs_dim, action_dim=action_dim).to(device)
+        sd = tmp.state_dict()
+        sd.update({k: v.to(device=device, dtype=sd[k].dtype) for k, v in trainable_state.items() if k in sd})
+        tmp.load_state_dict(sd)
+        tmp.eval()
+        torch.manual_seed(0)
+        obs = torch.randn(64, obs_dim, device=device)
+        targets = torch.randint(0, action_dim, (64,), device=device)
+        with torch.no_grad():
+            logits, _ = tmp(obs)
+            return float(torch.nn.functional.cross_entropy(logits, targets).item())
+
+    base_state = aggregator.get_current_state()
+    loss_before = eval_with_state(base_state)
+    patched = {
+        k: (base_state[k] + delta_state.get(k, torch.zeros_like(base_state[k]))).to(torch.float32)
+        for k in base_state.keys()
+    }
+    loss_after = eval_with_state(patched)
+    return loss_before - loss_after
+
+
+def _cosine_similarity_delta(a: Dict[str, torch.Tensor], b: Dict[str, torch.Tensor]) -> float:
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for k, ta in a.items():
+        tb = b.get(k)
+        if tb is None:
+            continue
+        va = ta.float().view(-1)
+        vb = tb.float().view(-1)
+        dot += float((va * vb).sum().item())
+        na += float((va * va).sum().item())
+        nb += float((vb * vb).sum().item())
+    if na <= 0.0 or nb <= 0.0:
+        return 0.0
+    return dot / math.sqrt(na * nb)
+
+
+def _select_best_deltas(submissions: List[Dict[str, object]], best_k: int) -> Tuple[List[str], Dict[str, torch.Tensor], int]:
+    """
+    Decide winners among submissions for a block. Returns:
+      (selected_submission_ids, aggregated_delta_state, total_samples)
+    """
+    decoded: List[Tuple[str, int, Dict[str, torch.Tensor], Dict]] = []
+    for s in submissions:
+        sid = str(s["submission_id"])
+        num_samples = int(s.get("num_samples") or 0)
+        delta_state = decode_delta(str(s["delta_b64"]))
+        metrics = s.get("metrics") if isinstance(s.get("metrics"), dict) else {}
+        decoded.append((sid, num_samples, delta_state, metrics))
+    if not decoded:
+        return [], {}, 0
+
+    # Score each submission.
+    scored: List[Tuple[float, str, int, Dict[str, torch.Tensor]]] = []
+    if TRAINER_BACKEND == "mlp":
+        for sid, ns, ds, _m in decoded:
+            score = _score_mlp_delta(ds)
+            scored.append((score, sid, ns, ds))
+    else:
+        # For LLM deltas, use consensus similarity to the mean delta.
+        mean: Dict[str, torch.Tensor] = {}
+        for _sid, _ns, ds, _m in decoded:
+            for k, t in ds.items():
+                mean[k] = mean.get(k, torch.zeros_like(t, dtype=torch.float32)) + t.float()
+        for k in list(mean.keys()):
+            mean[k] = mean[k] / float(len(decoded))
+        for sid, ns, ds, _m in decoded:
+            score = _cosine_similarity_delta(ds, mean)
+            scored.append((score, sid, ns, ds))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    winners = scored[: max(1, int(best_k))]
+    total_samples = sum(w[2] for w in winners) or len(winners)
+    agg: Dict[str, torch.Tensor] = {}
+    for _score, _sid, ns, ds in winners:
+        weight = float(ns) / float(total_samples) if total_samples else 1.0 / float(len(winners))
+        for k, t in ds.items():
+            agg[k] = agg.get(k, torch.zeros_like(t, dtype=torch.float32)) + (t.float() * weight)
+    # store as fp16 to match other deltas
+    agg_fp16 = {k: v.to(torch.float16) for k, v in agg.items()}
+    selected_ids = [w[1] for w in winners]
+    return selected_ids, agg_fp16, int(total_samples)
 
 
 def delta_l2_norm(delta_state: Dict[str, torch.Tensor]) -> float:
@@ -349,9 +455,12 @@ def get_task():
             "batch_size": 1,
         }
         if selected:
+            task["assignment_id"] = selected.get("assignment_id")
             task["block_id"] = selected["block_id"]
             task["block_hash"] = selected.get("hash")
             task["target_adapter"] = selected.get("target_adapter")
+            task["replicas_per_block"] = int(selected.get("required_replicas") or REPLICAS_PER_BLOCK)
+            task["submissions_count"] = int(selected.get("submissions_count") or 0)
         task["trainer_backend"] = TRAINER_BACKEND
         if TRAINER_BACKEND == "llm":
             task["adapter_name"] = llm_adapter_name
@@ -551,6 +660,8 @@ def enqueue_blocks():
     blocks_path = payload.get("blocks_path")
     dataset_label = payload.get("dataset_label", "unknown")
     target_adapter = payload.get("target_adapter")
+    replicas = int(payload.get("replicas") or REPLICAS_PER_BLOCK)
+    best_k = int(payload.get("best_k") or BEST_K_PER_BLOCK)
     if not blocks_path or not Path(blocks_path).exists():
         return jsonify({"error": "blocks_path not found"}), 400
     blocks: List[Dict] = []
@@ -566,8 +677,24 @@ def enqueue_blocks():
             if not obj.get("block_id"):
                 obj["block_id"] = str(uuid.uuid4())
             blocks.append(obj)
-    added = db_enqueue_blocks(TRAINER_DB_PATH, blocks, dataset_label=dataset_label, target_adapter=target_adapter, updated_at=_now())
-    emit_event("info", "blocks_enqueued", count=added, dataset_label=dataset_label, target_adapter=target_adapter)
+    added = db_enqueue_blocks(
+        TRAINER_DB_PATH,
+        blocks,
+        dataset_label=dataset_label,
+        target_adapter=target_adapter,
+        updated_at=_now(),
+        required_replicas=replicas,
+        best_k=best_k,
+    )
+    emit_event(
+        "info",
+        "blocks_enqueued",
+        count=added,
+        dataset_label=dataset_label,
+        target_adapter=target_adapter,
+        replicas=replicas,
+        best_k=best_k,
+    )
     return jsonify({"message": f"Enqueued {added} blocks from {blocks_path}"}), 200
 
 
@@ -695,7 +822,7 @@ def metrics_valid(metrics: Dict) -> bool:
 @app.route("/submit_update", methods=["POST"])
 def submit_update():
     payload = request.get_json(force=True, silent=True) or {}
-    required = ["task_id", "base_model_version", "num_samples", "lora_delta"]
+    required = ["task_id", "base_model_version", "num_samples", "lora_delta", "assignment_id"]
     missing = [k for k in required if k not in payload]
     if missing:
         return jsonify({"accepted": False, "reason": f"missing fields: {', '.join(missing)}"}), 400
@@ -706,12 +833,17 @@ def submit_update():
     if not metrics_valid(metrics):
         return jsonify({"accepted": False, "reason": "metrics_invalid"}), 400
 
-    block_id = payload.get("block_id")
+    assignment_id = str(payload.get("assignment_id"))
+    assignment = get_assignment(TRAINER_DB_PATH, assignment_id)
+    if not assignment:
+        return jsonify({"accepted": False, "reason": "unknown_assignment"}), 400
+    block_id = assignment.get("block_id")
     node_id = payload.get("node_id") or request.headers.get("X-Node-Id") or request.remote_addr or "unknown"
+    if payload.get("block_id") and payload.get("block_id") != block_id:
+        return jsonify({"accepted": False, "reason": "block_id_mismatch"}), 400
     if REQUIRE_BLOCK_HASH:
         if "block_id" not in payload or "block_hash" not in payload:
             return jsonify({"accepted": False, "reason": "block_hash_required"}), 400
-        block_id = payload["block_id"]
         submitted_hash = payload["block_hash"]
         canonical_hash = block_hashes.get(block_id)
         if canonical_hash is None:
@@ -742,39 +874,81 @@ def submit_update():
         global_state = aggregator.get_current_state()
         if not validate_delta(delta_state, global_state):
             return jsonify({"accepted": False, "reason": "bad_delta_shape"}), 400
-        accepted, aggregated = aggregator.submit_update(base_version, num_samples, delta_state, metrics)
-        if not accepted:
-            return jsonify({"accepted": False, "reason": "stale_version"}), 400
-        loss_val = metrics.get("train_loss_mean", None) if isinstance(metrics, dict) else None
-        append_history(
+        # Persist raw submission and mark assignment complete.
+        mark_assignment_status(TRAINER_DB_PATH, assignment_id=assignment_id, status="completed", updated_at=_now())
+        record_submission(
             TRAINER_DB_PATH,
-            block_id=block_id or "",
+            assignment_id=assignment_id,
+            block_id=block_id,
             node_id=node_id,
-            status="submitted",
-            loss=float(loss_val) if loss_val is not None else None,
-            updated_at=_now(),
-            model_version=aggregator.current_version,
+            base_version=base_version,
+            num_samples=num_samples,
+            delta_b64=payload["lora_delta"],
+            metrics=metrics if isinstance(metrics, dict) else {},
+            score=0.0,
+            selected=False,
+            created_at=_now(),
         )
-        if block_id:
-            mark_block_status(TRAINER_DB_PATH, block_id=block_id, status="completed", updated_at=_now())
-            try:
-                increment_node_blocks_completed(TRAINER_DB_PATH, node_id=node_id, amount=1)
-            except Exception:
-                pass
-        emit_event("info", "update_submitted", node_id=node_id, block_id=block_id, base_version=base_version, aggregated=aggregated)
-        # Save checkpoint if we aggregated this round
-        if aggregated:
-            apply_agg_state_to_model()
-            if TRAINER_BACKEND == "llm":
-                save_lora_checkpoint(
-                    lora_state=aggregator.get_current_state(),
-                    version=aggregator.current_version,
-                    output_dir=CHECKPOINT_DIR,
-                    metadata={"adapter_name": llm_adapter_name, "base_model": llm_base_model},
+        emit_event("info", "submission_received", node_id=node_id, block_id=block_id, assignment_id=assignment_id)
+
+        # If we have enough replicas for this block, decide winners and submit one aggregated delta to the round aggregator.
+        meta = get_block_meta(TRAINER_DB_PATH, block_id)
+        required_replicas = int((meta or {}).get("required_replicas") or REPLICAS_PER_BLOCK)
+        best_k = int((meta or {}).get("best_k") or BEST_K_PER_BLOCK)
+        decided = bool((meta or {}).get("decided"))
+
+        subs = list_block_submissions(TRAINER_DB_PATH, block_id)
+        if (not decided) and len(subs) >= required_replicas:
+            selected_ids, agg_delta, total_samples = _select_best_deltas(subs, best_k=best_k)
+            if selected_ids and agg_delta:
+                set_selected_submissions(TRAINER_DB_PATH, selected_ids, selected=True)
+                accepted, aggregated_now = aggregator.submit_update(
+                    base_version=base_version,
+                    num_samples=total_samples,
+                    delta_state=agg_delta,
+                    metrics={"block_id": block_id, "selected_k": len(selected_ids)},
                 )
-            else:
-                assert optimizer is not None
-                save_checkpoint(model, optimizer, aggregator.current_version, CHECKPOINT_DIR)
+                if not accepted:
+                    emit_event("warn", "block_decision_stale", block_id=block_id, base_version=base_version)
+                else:
+                    set_block_decided(TRAINER_DB_PATH, block_id=block_id, decided=True, status="completed", updated_at=_now())
+                    mark_block_status(TRAINER_DB_PATH, block_id=block_id, status="completed", updated_at=_now())
+                    try:
+                        increment_node_blocks_completed(TRAINER_DB_PATH, node_id=node_id, amount=1)
+                    except Exception:
+                        pass
+                    loss_val = metrics.get("train_loss_mean", None) if isinstance(metrics, dict) else None
+                    append_history(
+                        TRAINER_DB_PATH,
+                        block_id=block_id,
+                        node_id=node_id,
+                        status="decided",
+                        loss=float(loss_val) if loss_val is not None else None,
+                        updated_at=_now(),
+                        model_version=aggregator.current_version,
+                    )
+                    emit_event(
+                        "info",
+                        "block_decided",
+                        block_id=block_id,
+                        required_replicas=required_replicas,
+                        best_k=best_k,
+                        selected_ids=selected_ids,
+                        aggregated_now=aggregated_now,
+                    )
+                    if aggregated_now:
+                        apply_agg_state_to_model()
+                        if TRAINER_BACKEND == "llm":
+                            save_lora_checkpoint(
+                                lora_state=aggregator.get_current_state(),
+                                version=aggregator.current_version,
+                                output_dir=CHECKPOINT_DIR,
+                                metadata={"adapter_name": llm_adapter_name, "base_model": llm_base_model},
+                            )
+                        else:
+                            assert optimizer is not None
+                            save_checkpoint(model, optimizer, aggregator.current_version, CHECKPOINT_DIR)
+
     return jsonify({"accepted": True, "current_policy_version": aggregator.current_version})
 
 

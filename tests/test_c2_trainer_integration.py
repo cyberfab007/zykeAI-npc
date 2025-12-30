@@ -46,6 +46,8 @@ def _load_trainer(tmp_path: Path):
     os.environ["ROUND_TIMEOUT_SEC"] = "999"
     os.environ["REQUIRE_BLOCK_HASH"] = "true"
     os.environ["TICK_INTERVAL_SEC"] = "999"
+    os.environ["REPLICAS_PER_BLOCK"] = "2"
+    os.environ["BEST_K_PER_BLOCK"] = "1"
 
     import trainer.server as server
 
@@ -72,53 +74,83 @@ def test_c2_queue_assign_submit_persist_and_events(tmp_path, monkeypatch):
     server = _load_trainer(tmp_path)
     client = server.app.test_client()
 
-    # Heartbeat registers node.
-    node_id = "node-a"
-    resp = client.post("/node_heartbeat", json={"node_id": node_id, "state": "idle", "capabilities": {"mode": "mlp"}})
+    # Heartbeat registers nodes.
+    node_a = "node-a"
+    node_b = "node-b"
+    resp = client.post("/node_heartbeat", json={"node_id": node_a, "state": "idle", "capabilities": {"mode": "mlp"}})
+    assert resp.status_code == 200
+    resp = client.post("/node_heartbeat", json={"node_id": node_b, "state": "idle", "capabilities": {"mode": "mlp"}})
     assert resp.status_code == 200
 
-    # Enqueue a couple blocks.
-    blocks_path = _write_blocks_file(tmp_path, n=2)
+    # Enqueue one block (will be replicated twice).
+    blocks_path = _write_blocks_file(tmp_path, n=1)
     resp = client.post("/enqueue_blocks", json={"dataset_label": "test", "blocks_path": str(blocks_path)})
     assert resp.status_code == 200
 
     qs = client.get("/queue_status").get_json()
-    assert qs["total"] == 2
-    assert qs["pending"] == 2
+    assert qs["total"] == 1
+    assert qs["pending"] == 1
 
-    # Claim a task: should include block_id and block_hash.
-    task = client.get("/get_task", query_string={"node_id": node_id}, headers={"X-Node-Id": node_id}).get_json()["task"]
-    assert task and task["block_id"].startswith("block-")
-    assert isinstance(task.get("block_hash"), str) and len(task["block_hash"]) == 64
+    # Claim tasks for the same block (replicas=2): should include assignment_id, block_id and block_hash.
+    task_a = client.get("/get_task", query_string={"node_id": node_a}, headers={"X-Node-Id": node_a}).get_json()["task"]
+    task_b = client.get("/get_task", query_string={"node_id": node_b}, headers={"X-Node-Id": node_b}).get_json()["task"]
+    assert task_a and task_a["block_id"].startswith("block-")
+    assert task_b and task_b["block_id"] == task_a["block_id"]
+    assert isinstance(task_a.get("assignment_id"), str) and task_a["assignment_id"]
+    assert isinstance(task_b.get("assignment_id"), str) and task_b["assignment_id"] != task_a["assignment_id"]
+    assert isinstance(task_a.get("block_hash"), str) and len(task_a["block_hash"]) == 64
 
     # Fetch the block bytes from trainer.
-    blk = client.get("/get_block", query_string={"block_id": task["block_id"]}).get_json()["block"]
-    assert blk["block_id"] == task["block_id"]
-    assert blk["block_hash"] == task["block_hash"]
+    blk = client.get("/get_block", query_string={"block_id": task_a["block_id"]}).get_json()["block"]
+    assert blk["block_id"] == task_a["block_id"]
+    assert blk["block_hash"] == task_a["block_hash"]
 
     # Build a tiny, non-zero delta in the correct shape.
-    weights = _decode_weights(client.get("/get_lora_weights", query_string={"version": task["model_version"]}).get_json())
+    weights = _decode_weights(client.get("/get_lora_weights", query_string={"version": task_a["model_version"]}).get_json())
     assert weights
     first_key = next(iter(weights.keys()))
-    delta = {k: torch.zeros_like(v, dtype=torch.float16) for k, v in weights.items()}
-    delta[first_key].view(-1)[0] = torch.tensor(1e-2, dtype=torch.float16)
-    delta_b64 = _encode_delta(delta)
+    delta1 = {k: torch.zeros_like(v, dtype=torch.float16) for k, v in weights.items()}
+    delta1[first_key].view(-1)[0] = torch.tensor(1e-2, dtype=torch.float16)
+    delta_b64_1 = _encode_delta(delta1)
+    delta2 = {k: torch.zeros_like(v, dtype=torch.float16) for k, v in weights.items()}
+    delta2[first_key].view(-1)[0] = torch.tensor(2e-2, dtype=torch.float16)
+    delta_b64_2 = _encode_delta(delta2)
 
-    payload = {
-        "task_id": task["task_id"],
-        "base_model_version": task["model_version"],
+    payload_a = {
+        "task_id": task_a["task_id"],
+        "base_model_version": task_a["model_version"],
         "num_samples": 8,
-        "lora_delta": delta_b64,
+        "lora_delta": delta_b64_1,
         "metrics": {"train_loss_mean": 1.0, "train_loss_last": 1.0, "grad_norm_mean": 0.1},
-        "block_id": task["block_id"],
-        "block_hash": task["block_hash"],
-        "node_id": node_id,
+        "assignment_id": task_a["assignment_id"],
+        "block_id": task_a["block_id"],
+        "block_hash": task_a["block_hash"],
+        "node_id": node_a,
     }
-    resp = client.post("/submit_update", json=payload, headers={"X-Node-Id": node_id})
+    payload_b = {
+        "task_id": task_b["task_id"],
+        "base_model_version": task_b["model_version"],
+        "num_samples": 8,
+        "lora_delta": delta_b64_2,
+        "metrics": {"train_loss_mean": 1.0, "train_loss_last": 1.0, "grad_norm_mean": 0.1},
+        "assignment_id": task_b["assignment_id"],
+        "block_id": task_b["block_id"],
+        "block_hash": task_b["block_hash"],
+        "node_id": node_b,
+    }
+
+    resp = client.post("/submit_update", json=payload_a, headers={"X-Node-Id": node_a})
     assert resp.status_code == 200
     body = resp.get_json()
     assert body["accepted"] is True
-    assert body["current_policy_version"] == task["model_version"] + 1  # NUM_TASKS_PER_ROUND=1 triggers aggregation
+    # Not decided until replica 2 arrives.
+    assert body["current_policy_version"] == task_a["model_version"]
+
+    resp = client.post("/submit_update", json=payload_b, headers={"X-Node-Id": node_b})
+    assert resp.status_code == 200
+    body2 = resp.get_json()
+    assert body2["accepted"] is True
+    assert body2["current_policy_version"] == task_a["model_version"] + 1  # block decision submitted 1 update; round size=1
 
     qs2 = client.get("/queue_status").get_json()
     assert qs2["completed"] == 1
@@ -126,13 +158,13 @@ def test_c2_queue_assign_submit_persist_and_events(tmp_path, monkeypatch):
     # Cluster should show the node and blocks_completed incremented.
     cluster = client.get("/cluster_status").get_json()
     nodes = {n["node_id"]: n for n in cluster["nodes"]}
-    assert node_id in nodes
-    assert int(nodes[node_id]["blocks_completed"]) >= 1
+    assert node_a in nodes
+    assert node_b in nodes
 
     # Disable node prevents new assignments.
-    resp = client.post("/disable_node", json={"node_id": node_id})
+    resp = client.post("/disable_node", json={"node_id": node_a})
     assert resp.status_code == 200
-    task2 = client.get("/get_task", query_string={"node_id": node_id}, headers={"X-Node-Id": node_id}).get_json()["task"]
+    task2 = client.get("/get_task", query_string={"node_id": node_a}, headers={"X-Node-Id": node_a}).get_json()["task"]
     assert task2 is None
 
     # Events SSE should produce backlog lines.
@@ -141,4 +173,3 @@ def test_c2_queue_assign_submit_persist_and_events(tmp_path, monkeypatch):
     assert "data:" in first_chunk
     assert "trainer_initialized" in first_chunk or "blocks_enqueued" in first_chunk
     resp.close()
-
