@@ -163,6 +163,7 @@ def _handle_single_request(body: dict):
     adapter_path = body.get("adapter_path")  # optional
     adapter_name = body.get("adapter_name") or DEFAULT_ADAPTER_NAME  # optional (manifest lookup)
     manifest_path = body.get("manifest_path", DEFAULT_MANIFEST_PATH)
+    adapter_version = body.get("adapter_version")
     if adapter_path and not ALLOW_CUSTOM_ADAPTER_PATH:
         raise ValueError("adapter_path not allowed; use adapter_name from manifest or enable ALLOW_CUSTOM_ADAPTER_PATH")
     max_new_tokens = int(body.get("max_new_tokens", 80))
@@ -201,6 +202,7 @@ def _handle_single_request(body: dict):
             enforce_schema=enforce_schema,
             use_flash_attn=use_flash_attn,
             compile_model=compile_model,
+            cache_tag=f"{adapter_name}:{adapter_version}" if (adapter_name and adapter_version is not None) else None,
         )
 
     try:

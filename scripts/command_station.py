@@ -26,7 +26,7 @@ import requests
 
 TRAINER_URL = "http://localhost:5001"  # trainer/server base URL
 INFERENCE_URL = "http://localhost:5000/generate"  # inference API for live test calls
-WORKER_CMD = ["python", "-m", "actors.worker", "--trainer-url", TRAINER_URL]
+WORKER_BASE_CMD = ["python", "-m", "actors.worker"]
 
 STATUS_ENDPOINT = "/worker_status"
 STARTER_TEST_ENDPOINT = "/run_starter_test"
@@ -47,12 +47,15 @@ class CommandStation(tk.Tk):
 
         self.worker_process = None
         self.log_queue = queue.Queue()
+        self._trainer_log_thread = None
+        self._trainer_log_stop = threading.Event()
 
         self._build_layout()
 
         # Periodic background polling.
         self.after(2000, self._poll_status_loop)
         self.after(250, self._poll_log_queue)
+        self._start_trainer_log_stream()
 
     # Layout -------------------------------------------------------------
     def _build_layout(self):
@@ -68,6 +71,10 @@ class CommandStation(tk.Tk):
         self.node_id_var = tk.StringVar(value="unknown")
         self.trainer_url_var = tk.StringVar(value=TRAINER_URL)
         self.inference_url_var = tk.StringVar(value=INFERENCE_URL)
+        self.worker_node_id_var = tk.StringVar(value="local")
+        self.worker_mode_var = tk.StringVar(value="mlp")
+        self.worker_adapter_name_var = tk.StringVar(value="")
+        self.follow_trainer_logs_var = tk.BooleanVar(value=True)
 
         ttk.Label(node_frame, text="Node ID:").grid(row=0, column=0, sticky="w")
         ttk.Label(node_frame, textvariable=self.node_id_var).grid(row=0, column=1, sticky="w")
@@ -82,6 +89,24 @@ class CommandStation(tk.Tk):
         ttk.Label(node_frame, text="Inference URL:").grid(row=3, column=0, sticky="w")
         infer_entry = ttk.Entry(node_frame, textvariable=self.inference_url_var, width=40)
         infer_entry.grid(row=3, column=1, sticky="w")
+
+        ttk.Label(node_frame, text="Local worker node_id:").grid(row=4, column=0, sticky="w")
+        ttk.Entry(node_frame, textvariable=self.worker_node_id_var, width=20).grid(row=4, column=1, sticky="w")
+
+        ttk.Label(node_frame, text="Worker mode:").grid(row=5, column=0, sticky="w")
+        ttk.Combobox(
+            node_frame, textvariable=self.worker_mode_var, values=["mlp", "llm"], width=8, state="readonly"
+        ).grid(row=5, column=1, sticky="w")
+
+        ttk.Label(node_frame, text="Worker adapter (llm):").grid(row=6, column=0, sticky="w")
+        ttk.Entry(node_frame, textvariable=self.worker_adapter_name_var, width=28).grid(row=6, column=1, sticky="w")
+
+        ttk.Checkbutton(
+            node_frame,
+            text="Stream trainer logs",
+            variable=self.follow_trainer_logs_var,
+            command=self._toggle_trainer_log_stream,
+        ).grid(row=7, column=0, columnspan=2, sticky="w")
 
         # Model status
         model_frame = ttk.LabelFrame(top_frame, text="Model / Adapter")
@@ -139,7 +164,7 @@ class CommandStation(tk.Tk):
 
         columns = ("block_id", "status", "loss", "updated_at")
         style = ttk.Style(self)
-        style.configure("Blocks.Treeview", rowheight=24)
+        style.configure("Blocks.Treeview", rowheight=28)
 
         self.blocks_tree = ttk.Treeview(
             blocks_frame, columns=columns, show="headings", height=8, style="Blocks.Treeview"
@@ -199,6 +224,12 @@ class CommandStation(tk.Tk):
         )
         self.dataset_label_var = tk.StringVar(value="dev_dataset")
         self.block_adapter_var = tk.StringVar(value="")
+        self.block_tokenizer_var = tk.StringVar(value="EleutherAI/pythia-410m-deduped")
+        self.block_seq_len_var = tk.StringVar(value="128")
+        self.block_steps_per_block_var = tk.StringVar(value="64")
+        self.block_env_id_var = tk.StringVar(value="offline_corpus")
+        self.block_npc_type_var = tk.StringVar(value="generic")
+        self.block_max_blocks_var = tk.StringVar(value="")
 
         ttk.Label(builder_frame, text="Input path/file:").grid(row=0, column=0, sticky="w")
         ttk.Entry(builder_frame, textvariable=self.input_path_var, width=40).grid(
@@ -228,6 +259,19 @@ class CommandStation(tk.Tk):
         ttk.Button(builder_frame, text="Build Blocks Locally", command=self.run_block_builder).grid(
             row=4, column=0, columnspan=2, sticky="we", pady=4
         )
+
+        ttk.Label(builder_frame, text="Tokenizer:").grid(row=0, column=3, sticky="w")
+        ttk.Entry(builder_frame, textvariable=self.block_tokenizer_var, width=30).grid(row=0, column=4, sticky="w")
+        ttk.Label(builder_frame, text="seq_len:").grid(row=1, column=3, sticky="w")
+        ttk.Entry(builder_frame, textvariable=self.block_seq_len_var, width=8).grid(row=1, column=4, sticky="w")
+        ttk.Label(builder_frame, text="steps/block:").grid(row=2, column=3, sticky="w")
+        ttk.Entry(builder_frame, textvariable=self.block_steps_per_block_var, width=8).grid(row=2, column=4, sticky="w")
+        ttk.Label(builder_frame, text="env_id:").grid(row=3, column=3, sticky="w")
+        ttk.Entry(builder_frame, textvariable=self.block_env_id_var, width=18).grid(row=3, column=4, sticky="w")
+        ttk.Label(builder_frame, text="npc_type:").grid(row=4, column=3, sticky="w")
+        ttk.Entry(builder_frame, textvariable=self.block_npc_type_var, width=18).grid(row=4, column=4, sticky="w")
+        ttk.Label(builder_frame, text="max_blocks:").grid(row=5, column=3, sticky="w")
+        ttk.Entry(builder_frame, textvariable=self.block_max_blocks_var, width=10).grid(row=5, column=4, sticky="w")
 
         # Block queue controls (talks to trainer)
         queue_frame = ttk.LabelFrame(bottom_frame, text="Global Block Queue")
@@ -287,11 +331,17 @@ class CommandStation(tk.Tk):
         self.test_player = tk.StringVar(value="Hello there")
         self.test_adapter_name = tk.StringVar(value="")
         self.test_audience = tk.StringVar(value="adult")
+        self.use_trainer_adapter_var = tk.BooleanVar(value=True)
 
         ttk.Label(infer_frame, text="Adapter name:").grid(row=0, column=0, sticky="w")
         ttk.Entry(infer_frame, textvariable=self.test_adapter_name, width=25).grid(
             row=0, column=1, sticky="we"
         )
+        ttk.Checkbutton(
+            infer_frame,
+            text="Use trainer adapter + sync export",
+            variable=self.use_trainer_adapter_var,
+        ).grid(row=0, column=2, sticky="w")
         ttk.Label(infer_frame, text="Audience (adult/minor):").grid(row=1, column=0, sticky="w")
         ttk.Entry(infer_frame, textvariable=self.test_audience, width=15).grid(
             row=1, column=1, sticky="w"
@@ -331,8 +381,16 @@ class CommandStation(tk.Tk):
             return
         self._log("Starting worker process...")
         try:
+            cmd = list(WORKER_BASE_CMD)
+            cmd += ["--trainer-url", self.trainer_url_var.get().rstrip("/")]
+            cmd += ["--node-id", (self.worker_node_id_var.get().strip() or "local")]
+            cmd += ["--mode", self.worker_mode_var.get()]
+            if self.worker_mode_var.get() == "llm":
+                adapter = self.worker_adapter_name_var.get().strip()
+                if adapter:
+                    cmd += ["--adapter-name", adapter]
             self.worker_process = subprocess.Popen(
-                WORKER_CMD,
+                cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -625,7 +683,19 @@ class CommandStation(tk.Tk):
                 self.input_path_var.get(),
                 "--output",
                 self.output_path_var.get(),
+                "--tokenizer",
+                self.block_tokenizer_var.get(),
+                "--seq-len",
+                self.block_seq_len_var.get(),
+                "--steps-per-block",
+                self.block_steps_per_block_var.get(),
+                "--env-id",
+                self.block_env_id_var.get(),
+                "--npc-type",
+                self.block_npc_type_var.get(),
             ]
+            if self.block_max_blocks_var.get().strip():
+                cmd += ["--max-blocks", self.block_max_blocks_var.get().strip()]
             self._log(f"Building blocks: {' '.join(cmd)}")
             try:
                 proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -651,6 +721,27 @@ class CommandStation(tk.Tk):
     # Live inference -----------------------------------------------------
     def run_live_inference(self):
         def _task():
+            adapter_name = self.test_adapter_name.get().strip()
+            adapter_version = None
+            if self.use_trainer_adapter_var.get():
+                status_adapter = str(self.adapter_name_var.get() or "").strip()
+                if not adapter_name and status_adapter and status_adapter != "-":
+                    adapter_name = status_adapter
+                try:
+                    trainer_url = self.trainer_url_var.get().rstrip("/")
+                    resp = requests.post(
+                        f"{trainer_url}/export_adapter",
+                        json={"adapter_name": adapter_name} if adapter_name else {},
+                        timeout=20,
+                    )
+                    resp.raise_for_status()
+                    export = resp.json()
+                    if export.get("ok"):
+                        adapter_version = export.get("model_version")
+                        self._log(f"Synced adapter from trainer: {export.get('output_dir')}")
+                except Exception as e:
+                    self._log(f"Trainer adapter export failed: {e}")
+
             payload = {
                 "persona": self.test_persona.get(),
                 "context": self.test_context.get(),
@@ -658,8 +749,10 @@ class CommandStation(tk.Tk):
                 "player_input": self.test_player.get(),
                 "audience": self.test_audience.get() if hasattr(self, "test_audience") else "adult",
             }
-            if self.test_adapter_name.get():
-                payload["adapter_name"] = self.test_adapter_name.get()
+            if adapter_name:
+                payload["adapter_name"] = adapter_name
+            if adapter_version is not None:
+                payload["adapter_version"] = adapter_version
             try:
                 url = self.inference_url_var.get().rstrip("/")
                 start = time.time()
@@ -682,6 +775,45 @@ class CommandStation(tk.Tk):
         self.infer_output.insert("end", msg + "\n")
         self.infer_output.see("end")
         self.infer_output.configure(state="disabled")
+
+    # Trainer log streaming (SSE) --------------------------------------
+    def _toggle_trainer_log_stream(self):
+        if self.follow_trainer_logs_var.get():
+            self._start_trainer_log_stream()
+        else:
+            self._stop_trainer_log_stream()
+
+    def _stop_trainer_log_stream(self):
+        self._trainer_log_stop.set()
+
+    def _start_trainer_log_stream(self):
+        if self._trainer_log_thread and self._trainer_log_thread.is_alive():
+            return
+        self._trainer_log_stop.clear()
+
+        def _stream():
+            while not self._trainer_log_stop.is_set():
+                if not self.follow_trainer_logs_var.get():
+                    time.sleep(1.0)
+                    continue
+                try:
+                    base = self.trainer_url_var.get().rstrip("/")
+                    with requests.get(f"{base}/events", stream=True, timeout=10) as r:
+                        r.raise_for_status()
+                        for raw in r.iter_lines(decode_unicode=True):
+                            if self._trainer_log_stop.is_set() or not self.follow_trainer_logs_var.get():
+                                break
+                            if not raw:
+                                continue
+                            if raw.startswith("data: "):
+                                payload = raw[len("data: ") :]
+                                self.log_queue.put(f"[trainer] {payload}")
+                except Exception as e:
+                    self.log_queue.put(f"[trainer] stream error: {e}")
+                    time.sleep(1.0)
+
+        self._trainer_log_thread = threading.Thread(target=_stream, daemon=True)
+        self._trainer_log_thread.start()
 
 
 def main():

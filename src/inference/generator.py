@@ -156,6 +156,7 @@ def generate_npc_response(
     enforce_schema: bool = True,
     use_flash_attn: bool = False,
     compile_model: bool = False,
+    cache_tag: Optional[str] = None,
 ) -> Dict[str, str]:
     prompt = build_npc_prompt(persona, context, state, player_input)
     model, tokenizer, device = load_model_with_adapter(
@@ -167,6 +168,7 @@ def generate_npc_response(
         quantization=quantization,
         use_flash_attn=use_flash_attn,
         compile_model=compile_model,
+        cache_tag=cache_tag,
     )
     inputs = tokenizer(
         prompt, return_tensors="pt", truncation=True, max_length=512

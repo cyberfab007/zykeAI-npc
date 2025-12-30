@@ -32,10 +32,11 @@ def load_model_with_adapter(
     quantization: Optional[str] = None,
     use_flash_attn: bool = False,
     compile_model: bool = False,
+    cache_tag: Optional[str] = None,
 ):
     """
     Load a Hugging Face causal LM and tokenizer, optionally applying a PEFT adapter and quantization.
-    Results are cached by (base_model, adapter_path, quantization, tokenizer_path, use_flash_attn, compile_model).
+    Results are cached by (base_model, adapter_path, quantization, tokenizer_path, use_flash_attn, compile_model, cache_tag).
     """
     if adapter_name and not adapter_path:
         adapter_path, _entry = select_adapter(adapter_name, manifest_path)

@@ -7,6 +7,7 @@ import io
 import json
 import math
 import os
+import queue
 import threading
 import time
 import uuid
@@ -14,15 +15,32 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import torch
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request, stream_with_context
 
 from trainer.checkpointing import save_checkpoint
 from trainer.lora_checkpointing import load_latest_lora_checkpoint, save_lora_checkpoint
+from trainer.db import (
+    append_history,
+    claim_next_block,
+    enqueue_blocks as db_enqueue_blocks,
+    get_block as db_get_block,
+    get_node,
+    increment_node_blocks_completed,
+    init_db,
+    list_nodes,
+    list_recent_blocks,
+    mark_block_status,
+    queue_counts,
+    recent_history,
+    set_node_enabled,
+    upsert_node,
+)
 from trainer.models import MLPPolicy, make_optimizer
 from trainer.update_validation import UpdateRejected, trimmed_mean, validate_update
 from trainer.weights import load_latest_checkpoint
 
 TRAINER_BACKEND = os.getenv("TRAINER_BACKEND", "mlp").lower()  # "mlp" | "llm"
+TRAINER_DB_PATH = os.getenv("TRAINER_DB_PATH", "models/trainer.db")
 
 NUM_TASKS_PER_ROUND = int(os.getenv("NUM_TASKS_PER_ROUND", "3"))
 MIN_UPDATES_PER_ROUND = int(os.getenv("MIN_UPDATES_PER_ROUND", "1"))
@@ -37,6 +55,33 @@ REQUIRE_BLOCK_HASH = os.getenv("REQUIRE_BLOCK_HASH", "false").lower() == "true"
 BLOCK_HASH_MAP = os.getenv("BLOCK_HASH_MAP")  # path to block_id->hash mapping (JSON)
 
 app = Flask(__name__)
+
+_event_clients: List[queue.Queue] = []
+_event_clients_lock = threading.Lock()
+_event_buffer: List[Dict] = []
+_EVENT_BUFFER_MAX = int(os.getenv("EVENT_BUFFER_MAX", "200"))
+
+
+def _now() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def emit_event(level: str, message: str, **fields):
+    evt = {"ts": _now(), "level": level, "message": message, **fields}
+    with _event_clients_lock:
+        _event_buffer.append(evt)
+        if len(_event_buffer) > _EVENT_BUFFER_MAX:
+            del _event_buffer[: len(_event_buffer) - _EVENT_BUFFER_MAX]
+        for q in list(_event_clients):
+            try:
+                q.put_nowait(evt)
+            except Exception:
+                # drop if client is too slow
+                pass
+    try:
+        app.logger.info(evt)
+    except Exception:
+        pass
 
 
 def get_trainable_state(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
@@ -150,18 +195,24 @@ optimizer: torch.optim.Optimizer | None
 aggregator: VersionedAggregator
 _ticker_thread: threading.Thread
 block_hashes: Dict[str, str] = {}
-task_history: List[Dict] = []
-queue_records: List[Dict] = []
-cluster_nodes: Dict[str, Dict] = {}
 llm_base_model: str | None = None
 llm_tokenizer_name: str | None = None
 llm_adapter_name: str | None = None
 
 
 def init_trainer():
-    global model, optimizer, aggregator, _ticker_thread, block_hashes, task_history, queue_records, cluster_nodes
+    global model, optimizer, aggregator, _ticker_thread, block_hashes
     global llm_base_model, llm_tokenizer_name, llm_adapter_name
     Path(CHECKPOINT_DIR).mkdir(parents=True, exist_ok=True)
+    init_db(TRAINER_DB_PATH)
+    upsert_node(
+        TRAINER_DB_PATH,
+        node_id=os.getenv("NODE_ID", "trainer"),
+        state="idle",
+        last_seen=_now(),
+        enabled=True,
+        capabilities={"role": "trainer", "backend": TRAINER_BACKEND, "device": "cuda" if torch.cuda.is_available() else "cpu"},
+    )
     if TRAINER_BACKEND == "llm":
         # LLM LoRA delta backend: maintain trainable LoRA weights only (no full-base checkpointing).
         llm_adapter_name = os.getenv("LLM_ADAPTER_NAME") or os.getenv("ADAPTER_NAME")
@@ -241,20 +292,9 @@ def init_trainer():
                 block_hashes = json.load(f)
         except Exception:
             block_hashes = {}
-    task_history = []
-    queue_records = []
-    cluster_nodes = {
-        os.getenv("NODE_ID", "local"): {
-            "node_id": os.getenv("NODE_ID", "local"),
-            "state": "idle",
-            "blocks_completed": 0,
-            "trust_score": 1.0,
-            "last_seen": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "enabled": True,
-        }
-    }
     _ticker_thread = threading.Thread(target=_tick_loop, daemon=True)
     _ticker_thread.start()
+    emit_event("info", "trainer_initialized", backend=TRAINER_BACKEND, checkpoint_dir=CHECKPOINT_DIR, db=TRAINER_DB_PATH)
 
 
 def apply_agg_state_to_model():
@@ -288,38 +328,36 @@ def _tick_loop():
                 else:
                     assert optimizer is not None
                     save_checkpoint(model, optimizer, aggregator.current_version, CHECKPOINT_DIR)
+                emit_event("info", "aggregated", model_version=aggregator.current_version)
 
 
 @app.route("/get_task", methods=["GET"])
 def get_task():
-    selected_block = None
-    with state_lock:
-        # Assign first pending block if available
-        for rec in queue_records:
-            if rec.get("status") == "pending":
-                selected_block = rec
-                rec["status"] = "assigned"
-                rec["assigned_to"] = os.getenv("NODE_ID", "local")
-                rec["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                break
+    node_id = request.headers.get("X-Node-Id") or request.args.get("node_id") or "unknown"
+    node = get_node(TRAINER_DB_PATH, node_id)
+    if node and not bool(node.get("enabled")):
+        return jsonify({"task": None}), 200
+
+    selected = claim_next_block(TRAINER_DB_PATH, node_id=node_id, updated_at=_now())
     with state_lock:
         task = {
             "task_id": str(uuid.uuid4()),
             "model_version": aggregator.current_version,
-            "data_shard_id": selected_block["block_id"] if selected_block else "stub",
+            "data_shard_id": selected["block_id"] if selected else "stub",
             "num_steps": 100,
             "learning_rate": 1e-4,
             "batch_size": 1,
         }
-        if selected_block:
-            task["block_id"] = selected_block["block_id"]
-            task["block_hash"] = selected_block.get("hash")
-            task["target_adapter"] = selected_block.get("target_adapter")
+        if selected:
+            task["block_id"] = selected["block_id"]
+            task["block_hash"] = selected.get("hash")
+            task["target_adapter"] = selected.get("target_adapter")
         task["trainer_backend"] = TRAINER_BACKEND
         if TRAINER_BACKEND == "llm":
             task["adapter_name"] = llm_adapter_name
             task["base_model"] = llm_base_model
             task["tokenizer"] = llm_tokenizer_name
+    emit_event("info", "task_assigned", node_id=node_id, block_id=task.get("block_id"), model_version=task.get("model_version"))
     return jsonify({"task": task})
 
 
@@ -342,31 +380,62 @@ def health():
     return jsonify({"status": "ok"}), 200
 
 
+@app.route("/events", methods=["GET"])
+def events():
+    client_q: queue.Queue = queue.Queue(maxsize=200)
+    with _event_clients_lock:
+        _event_clients.append(client_q)
+        backlog = list(_event_buffer)
+
+    def gen():
+        try:
+            for evt in backlog:
+                yield f"data: {json.dumps(evt)}\n\n"
+            while True:
+                evt = client_q.get()
+                yield f"data: {json.dumps(evt)}\n\n"
+        finally:
+            with _event_clients_lock:
+                if client_q in _event_clients:
+                    _event_clients.remove(client_q)
+
+    return Response(stream_with_context(gen()), mimetype="text/event-stream")
+
+
+@app.route("/node_heartbeat", methods=["POST"])
+def node_heartbeat():
+    payload = request.get_json(force=True, silent=True) or {}
+    node_id = payload.get("node_id") or request.headers.get("X-Node-Id") or request.remote_addr or "unknown"
+    state = payload.get("state", "idle")
+    capabilities = payload.get("capabilities") if isinstance(payload.get("capabilities"), dict) else {}
+    upsert_node(TRAINER_DB_PATH, node_id=node_id, state=state, last_seen=_now(), enabled=bool(payload.get("enabled", True)), capabilities=capabilities)
+    return jsonify({"ok": True}), 200
+
+
 @app.route("/worker_status", methods=["GET"])
 def worker_status():
     with state_lock:
         state = "training" if aggregator.pending_updates.get(aggregator.current_version) else "idle"
-        if not cluster_nodes.get(os.getenv("NODE_ID", "local"), {}).get("enabled", True):
-            state = "disabled"
         blocks = []
-        for entry in task_history[-10:]:
+        for entry in recent_history(TRAINER_DB_PATH, limit=10):
             blocks.append(
                 {
                     "block_id": entry.get("block_id", ""),
                     "status": entry.get("status", ""),
                     "loss": entry.get("loss", ""),
                     "updated_at": entry.get("updated_at", ""),
+                    "node_id": entry.get("node_id", ""),
                 }
             )
         status = {
-            "node_id": os.getenv("NODE_ID", "local"),
+            "node_id": os.getenv("NODE_ID", "trainer"),
             "state": state,
             "base_model_version": aggregator.current_version if aggregator else None,
             "adapter_name": llm_adapter_name if TRAINER_BACKEND == "llm" else None,
             "quantization": None,
             "use_flash_attn": False,
             "compile_model": False,
-            "blocks_processed": len(task_history),
+            "blocks_processed": len(blocks),
             "blocks": blocks,
             "device": "cuda" if torch.cuda.is_available() else "cpu",
             "trainer_backend": TRAINER_BACKEND,
@@ -484,8 +553,8 @@ def enqueue_blocks():
     target_adapter = payload.get("target_adapter")
     if not blocks_path or not Path(blocks_path).exists():
         return jsonify({"error": "blocks_path not found"}), 400
-    added = 0
-    with Path(blocks_path).open("r", encoding="utf-8") as f:
+    blocks: List[Dict] = []
+    with Path(blocks_path).open("r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -493,21 +562,12 @@ def enqueue_blocks():
             try:
                 obj = json.loads(line)
             except Exception:
-                obj = {}
-            block_id = obj.get("block_id") or str(uuid.uuid4())
-            queue_records.append(
-                {
-                    "block_id": block_id,
-                    "task": dataset_label,
-                    "target_adapter": target_adapter,
-                    "status": "pending",
-                    "hash": obj.get("block_hash"),
-                    "block_data": obj,
-                    "assigned_to": None,
-                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                }
-            )
-            added += 1
+                continue
+            if not obj.get("block_id"):
+                obj["block_id"] = str(uuid.uuid4())
+            blocks.append(obj)
+    added = db_enqueue_blocks(TRAINER_DB_PATH, blocks, dataset_label=dataset_label, target_adapter=target_adapter, updated_at=_now())
+    emit_event("info", "blocks_enqueued", count=added, dataset_label=dataset_label, target_adapter=target_adapter)
     return jsonify({"message": f"Enqueued {added} blocks from {blocks_path}"}), 200
 
 
@@ -516,41 +576,19 @@ def get_block():
     block_id = request.args.get("block_id")
     if not block_id:
         return jsonify({"error": "block_id required"}), 400
-    with state_lock:
-        for rec in queue_records:
-            if rec.get("block_id") == block_id:
-                return jsonify({"block": rec.get("block_data")}), 200
+    block = db_get_block(TRAINER_DB_PATH, block_id)
+    if block:
+        return jsonify({"block": block}), 200
     return jsonify({"error": "block not found"}), 404
 
 
 @app.route("/queue_status", methods=["GET"])
 def queue_status():
-    with state_lock:
-        pending = sum(1 for b in queue_records if b.get("status") == "pending")
-        assigned = sum(1 for b in queue_records if b.get("status") == "assigned")
-        completed = sum(1 for b in queue_records if b.get("status") == "completed")
-        failed = sum(1 for b in queue_records if b.get("status") == "failed")
-        total = len(queue_records)
-        blocks = []
-        for rec in queue_records[-50:]:
-            blocks.append(
-                {
-                    "block_id": rec.get("block_id"),
-                    "task": rec.get("task"),
-                    "target_adapter": rec.get("target_adapter"),
-                    "status": rec.get("status"),
-                    "hash": rec.get("hash"),
-                    "assigned_to": rec.get("assigned_to"),
-                    "updated_at": rec.get("updated_at"),
-                }
-            )
+    counts = queue_counts(TRAINER_DB_PATH)
+    blocks = list_recent_blocks(TRAINER_DB_PATH, limit=50)
     return jsonify(
         {
-            "total": total,
-            "pending": pending,
-            "assigned": assigned,
-            "completed": completed,
-            "failed": failed,
+            **counts,
             "blocks": blocks,
         }
     )
@@ -558,12 +596,19 @@ def queue_status():
 
 @app.route("/cluster_status", methods=["GET"])
 def cluster_status():
-    now = time.strftime("%Y-%m-%d %H:%M:%S")
-    with state_lock:
-        nodes = []
-        for node_id, node in cluster_nodes.items():
-            node["last_seen"] = now
-            nodes.append(node.copy())
+    nodes = []
+    for row in list_nodes(TRAINER_DB_PATH):
+        nodes.append(
+            {
+                "node_id": row.get("node_id"),
+                "state": row.get("state"),
+                "blocks_completed": int(row.get("blocks_completed") or 0),
+                "trust_score": float(row.get("trust_score") or 0.0),
+                "last_seen": row.get("last_seen"),
+                "enabled": bool(row.get("enabled")),
+                "capabilities": row.get("capabilities", {}),
+            }
+        )
     return jsonify({"nodes": nodes})
 
 
@@ -573,11 +618,10 @@ def disable_node():
     node_id = payload.get("node_id")
     if not node_id:
         return jsonify({"error": "node_id required"}), 400
-    with state_lock:
-        if node_id not in cluster_nodes:
-            return jsonify({"error": "node not found"}), 404
-        cluster_nodes[node_id]["enabled"] = False
-        cluster_nodes[node_id]["state"] = "disabled"
+    ok = set_node_enabled(TRAINER_DB_PATH, node_id=node_id, enabled=False, updated_at=_now())
+    if not ok:
+        return jsonify({"error": "node not found"}), 404
+    emit_event("info", "node_disabled", node_id=node_id)
     return jsonify({"message": f"Node {node_id} disabled"}), 200
 
 
@@ -587,12 +631,52 @@ def enable_node():
     node_id = payload.get("node_id")
     if not node_id:
         return jsonify({"error": "node_id required"}), 400
-    with state_lock:
-        if node_id not in cluster_nodes:
-            return jsonify({"error": "node not found"}), 404
-        cluster_nodes[node_id]["enabled"] = True
-        cluster_nodes[node_id]["state"] = "idle"
+    ok = set_node_enabled(TRAINER_DB_PATH, node_id=node_id, enabled=True, updated_at=_now())
+    if not ok:
+        return jsonify({"error": "node not found"}), 404
+    emit_event("info", "node_enabled", node_id=node_id)
     return jsonify({"message": f"Node {node_id} enabled"}), 200
+
+
+@app.route("/export_adapter", methods=["POST"])
+def export_adapter():
+    if TRAINER_BACKEND != "llm":
+        return jsonify({"ok": False, "error": "export_adapter only supported for TRAINER_BACKEND=llm"}), 400
+    payload = request.get_json(force=True, silent=True) or {}
+    adapter_name = payload.get("adapter_name") or llm_adapter_name
+    if not adapter_name:
+        return jsonify({"ok": False, "error": "adapter_name required"}), 400
+    manifest_path = payload.get("manifest_path") or os.getenv("LLM_MANIFEST_PATH", "data/adapters/manifest.json")
+    try:
+        from src.models.adapter_manifest import select_adapter
+
+        adapter_path, _entry = select_adapter(adapter_name, manifest_path)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"manifest lookup failed: {exc}"}), 400
+
+    out_dir = Path(payload.get("output_dir") or adapter_path)
+    # Safety: keep exports inside models/adapters unless explicitly allowed.
+    allowed_root = Path("models/adapters").resolve()
+    if allowed_root not in out_dir.resolve().parents and out_dir.resolve() != allowed_root:
+        return jsonify({"ok": False, "error": f"output_dir must be under {allowed_root}"}), 400
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with state_lock:
+        model.save_pretrained(str(out_dir))
+    (out_dir / "trainer_export.json").write_text(
+        json.dumps(
+            {
+                "exported_at": _now(),
+                "model_version": aggregator.current_version,
+                "adapter_name": adapter_name,
+                "base_model": llm_base_model,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    emit_event("info", "adapter_exported", adapter_name=adapter_name, output_dir=str(out_dir), model_version=aggregator.current_version)
+    return jsonify({"ok": True, "adapter_name": adapter_name, "output_dir": str(out_dir), "model_version": aggregator.current_version}), 200
 
 
 def metrics_valid(metrics: Dict) -> bool:
@@ -623,6 +707,7 @@ def submit_update():
         return jsonify({"accepted": False, "reason": "metrics_invalid"}), 400
 
     block_id = payload.get("block_id")
+    node_id = payload.get("node_id") or request.headers.get("X-Node-Id") or request.remote_addr or "unknown"
     if REQUIRE_BLOCK_HASH:
         if "block_id" not in payload or "block_hash" not in payload:
             return jsonify({"accepted": False, "reason": "block_hash_required"}), 400
@@ -630,10 +715,9 @@ def submit_update():
         submitted_hash = payload["block_hash"]
         canonical_hash = block_hashes.get(block_id)
         if canonical_hash is None:
-            for rec in queue_records:
-                if rec.get("block_id") == block_id:
-                    canonical_hash = rec.get("hash")
-                    break
+            node_block = db_get_block(TRAINER_DB_PATH, block_id)
+            if node_block:
+                canonical_hash = node_block.get("block_hash")
         if canonical_hash is None:
             return jsonify({"accepted": False, "reason": "unknown_block_id"}), 400
     else:
@@ -661,21 +745,23 @@ def submit_update():
         accepted, aggregated = aggregator.submit_update(base_version, num_samples, delta_state, metrics)
         if not accepted:
             return jsonify({"accepted": False, "reason": "stale_version"}), 400
-        # Record task in history
-        task_history.append(
-            {
-                "block_id": block_id or "",
-                "status": "submitted",
-                "loss": metrics.get("train_loss_mean", None) if isinstance(metrics, dict) else None,
-                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            }
+        loss_val = metrics.get("train_loss_mean", None) if isinstance(metrics, dict) else None
+        append_history(
+            TRAINER_DB_PATH,
+            block_id=block_id or "",
+            node_id=node_id,
+            status="submitted",
+            loss=float(loss_val) if loss_val is not None else None,
+            updated_at=_now(),
+            model_version=aggregator.current_version,
         )
         if block_id:
-            for rec in queue_records:
-                if rec.get("block_id") == block_id:
-                    rec["status"] = "completed"
-                    rec["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                    break
+            mark_block_status(TRAINER_DB_PATH, block_id=block_id, status="completed", updated_at=_now())
+            try:
+                increment_node_blocks_completed(TRAINER_DB_PATH, node_id=node_id, amount=1)
+            except Exception:
+                pass
+        emit_event("info", "update_submitted", node_id=node_id, block_id=block_id, base_version=base_version, aggregated=aggregated)
         # Save checkpoint if we aggregated this round
         if aggregated:
             apply_agg_state_to_model()

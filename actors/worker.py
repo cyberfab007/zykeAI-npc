@@ -14,6 +14,7 @@ import base64
 import io
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -34,6 +35,7 @@ from trainer.models import MLPPolicy, make_optimizer
 def parse_args():
     p = argparse.ArgumentParser(description="Worker to exercise trainer endpoints with real deltas.")
     p.add_argument("--trainer-url", default=os.getenv("TRAINER_URL", "http://localhost:5001"))
+    p.add_argument("--node-id", default=os.getenv("NODE_ID", "local"))
     p.add_argument("--mode", default=os.getenv("WORKER_MODE", "mlp"), choices=["mlp", "llm"])
     p.add_argument("--num-tasks", type=int, default=int(os.getenv("NUM_TASKS", "3")))
     p.add_argument("--sleep", type=float, default=float(os.getenv("SLEEP_SEC", "0.5")))
@@ -67,8 +69,13 @@ def serialize_state(state: Dict[str, torch.Tensor]) -> str:
     return base64.b64encode(buf.read()).decode("ascii")
 
 
-def fetch_task(trainer_url: str) -> Dict:
-    r = requests.get(f"{trainer_url}/get_task", timeout=10)
+def fetch_task(trainer_url: str, node_id: str) -> Dict:
+    r = requests.get(
+        f"{trainer_url}/get_task",
+        params={"node_id": node_id},
+        headers={"X-Node-Id": node_id},
+        timeout=10,
+    )
     r.raise_for_status()
     body = r.json()
     return body.get("task") if isinstance(body, dict) else body
@@ -203,7 +210,12 @@ def train_one_task_mlp(task: Dict, trainer_url: str, args) -> Dict:
         "block_id": task.get("block_id"),
         "block_hash": task.get("block_hash"),
     }
-    resp = requests.post(f"{trainer_url}/submit_update", json=payload, timeout=60)
+    resp = requests.post(
+        f"{trainer_url}/submit_update",
+        json={**payload, "node_id": args.node_id},
+        headers={"X-Node-Id": args.node_id},
+        timeout=60,
+    )
     resp.raise_for_status()
     return resp.json()
 
@@ -324,7 +336,12 @@ def train_one_task_llm(task: Dict, trainer_url: str, args) -> Dict:
         "block_id": block_id,
         "block_hash": task.get("block_hash"),
     }
-    resp = requests.post(f"{trainer_url}/submit_update", json=payload, timeout=120)
+    resp = requests.post(
+        f"{trainer_url}/submit_update",
+        json={**payload, "node_id": args.node_id},
+        headers={"X-Node-Id": args.node_id},
+        timeout=120,
+    )
     resp.raise_for_status()
     return resp.json()
 
@@ -337,19 +354,50 @@ def train_one_task(task: Dict, trainer_url: str, args) -> Dict:
 
 def main():
     args = parse_args()
+    stop_heartbeat = threading.Event()
+    state_lock = threading.Lock()
+    worker_state = {"state": "idle"}
+
+    def heartbeat_loop():
+        while not stop_heartbeat.is_set():
+            try:
+                with state_lock:
+                    cur_state = worker_state["state"]
+                requests.post(
+                    f"{args.trainer_url}/node_heartbeat",
+                    json={
+                        "node_id": args.node_id,
+                        "state": cur_state,
+                        "capabilities": {
+                            "mode": args.mode,
+                            "device": "cuda" if torch.cuda.is_available() else "cpu",
+                            "adapter_name": args.adapter_name,
+                            "base_model": args.base_model,
+                        },
+                    },
+                    timeout=5,
+                )
+            except Exception:
+                pass
+            stop_heartbeat.wait(2.0)
+    threading.Thread(target=heartbeat_loop, daemon=True).start()
     for _ in range(args.num_tasks):
-        task = fetch_task(args.trainer_url)
+        task = fetch_task(args.trainer_url, node_id=args.node_id)
         if not task:
             time.sleep(args.sleep)
             continue
+        with state_lock:
+            worker_state["state"] = "training"
         result = train_one_task(task, args.trainer_url, args)
+        with state_lock:
+            worker_state["state"] = "idle"
         print(
             f"Submitted task {task['task_id']} base_version={task['model_version']} -> "
             f"policy_version={result.get('current_policy_version')}"
         )
         time.sleep(args.sleep)
+    stop_heartbeat.set()
 
 
 if __name__ == "__main__":
     main()
-
