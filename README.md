@@ -45,6 +45,7 @@ Recommended baselines:
 ├── trainer/                     # Distributed training scaffold (trainer loop)
 ├── policy_service/              # Policy service stub
 ├── actors/                      # Actor client / worker / logger
+├── npc/                         # NPC agent loops (sense→think→act)
 ├── examples/                    # Educational transformer implementation
 ├── openweb/                     # Open WebUI + Ollama compose
 ├── results/                     # (gitignored) training artifacts
