@@ -11,8 +11,14 @@ COPY requirements.txt /app/requirements.txt
 RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir -r /app/requirements.txt
 
-# Copy deployment app
+# Copy deployment app and importable runtime code used by deployment.app.
 COPY deployment /app/deployment
+COPY src /app/src
+COPY npc /app/npc
+COPY actors /app/actors
+COPY schemas /app/schemas
+COPY configs /app/configs
+COPY data /app/data
 
 EXPOSE 5000
 
