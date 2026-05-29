@@ -48,9 +48,27 @@ def test_worker_contract_endpoints(client):
     assert training_resp.status_code == 200
     assert training_resp.get_json()["status"] == "idle"
 
+    training_start_resp = client.post("/training/start", json={"job_id": "job-1"})
+    assert training_start_resp.status_code == 202
+    assert training_start_resp.get_json()["status"] == "accepted"
+
+    training_stop_resp = client.post("/training/stop", json={"job_id": "job-1"})
+    assert training_stop_resp.status_code == 200
+
+    training_export_resp = client.post("/training/export-delta", json={"job_id": "job-1"})
+    assert training_export_resp.status_code == 200
+    assert training_export_resp.get_json()["status"] == "not_available"
+
     memory_resp = client.get("/memory/status")
     assert memory_resp.status_code == 200
     assert "status" in memory_resp.get_json()
+
+    memory_query_resp = client.post("/memory/query", json={"query": "hello"})
+    assert memory_query_resp.status_code == 200
+    assert memory_query_resp.get_json()["entries"] == []
+
+    memory_update_resp = client.post("/memory/update", json={"entry": "hello"})
+    assert memory_update_resp.status_code == 202
 
 
 def test_generate_single(client):

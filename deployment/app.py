@@ -126,6 +126,38 @@ def training_status():
     ), 200
 
 
+@app.route("/training/start", methods=["POST"])
+@require_auth
+def training_start():
+    return jsonify(
+        {
+            "status": "accepted",
+            "supported": False,
+            "message": "Training execution is reserved for the next worker build.",
+            "job": request.get_json(force=True, silent=True) or {},
+        }
+    ), 202
+
+
+@app.route("/training/stop", methods=["POST"])
+@require_auth
+def training_stop():
+    return jsonify({"status": "stopped", "supported": False}), 200
+
+
+@app.route("/training/export-delta", methods=["POST"])
+@require_auth
+def training_export_delta():
+    return jsonify(
+        {
+            "status": "not_available",
+            "supported": False,
+            "artifact": None,
+            "sha256": None,
+        }
+    ), 200
+
+
 @app.route("/memory/status", methods=["GET"])
 @require_auth
 def memory_status():
@@ -137,6 +169,18 @@ def memory_status():
             "entries": len([p for p in memory_dir.iterdir() if p.is_file()]) if memory_dir.exists() else 0,
         }
     ), 200
+
+
+@app.route("/memory/query", methods=["POST"])
+@require_auth
+def memory_query():
+    return jsonify({"status": "ok", "entries": []}), 200
+
+
+@app.route("/memory/update", methods=["POST"])
+@require_auth
+def memory_update():
+    return jsonify({"status": "accepted", "stored": False}), 202
 
 
 @app.route("/metrics", methods=["GET"])
