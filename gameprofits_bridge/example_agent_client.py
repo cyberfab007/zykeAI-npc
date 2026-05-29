@@ -4,10 +4,13 @@ import urllib.request
 
 
 WORKER_URL = os.getenv("ZYKE_WORKER_URL", "http://127.0.0.1:5000")
-API_TOKEN = os.getenv("ZYKE_LOCAL_API_TOKEN", "zyke-local-agent-token")
+API_TOKEN = os.getenv("ZYKE_LOCAL_API_TOKEN")
 
 
 def generate(payload: dict) -> dict:
+    if not API_TOKEN:
+        raise RuntimeError("Set ZYKE_LOCAL_API_TOKEN to the local worker bearer token.")
+
     request = urllib.request.Request(
         f"{WORKER_URL.rstrip('/')}/generate",
         data=json.dumps(payload).encode("utf-8"),
