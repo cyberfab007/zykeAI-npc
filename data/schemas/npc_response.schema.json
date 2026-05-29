@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ZykeAI NPC Generate Response",
+  "type": "object",
+  "required": ["say", "action", "emotion"],
+  "properties": {
+    "say": { "type": "string", "minLength": 1, "maxLength": 500 },
+    "action": {
+      "type": "string",
+      "enum": ["idle", "nod", "point", "warn", "give_item", "take_item", "attack", "defend"]
+    },
+    "emotion": {
+      "type": "string",
+      "enum": ["neutral", "happy", "angry", "afraid", "sad", "curious"]
+    },
+    "thoughts": { "type": "string", "maxLength": 500 }
+  },
+  "additionalProperties": false
+}

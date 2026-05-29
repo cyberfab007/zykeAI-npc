@@ -1,0 +1,10 @@
+[
+  "idle",
+  "nod",
+  "point",
+  "warn",
+  "give_item",
+  "take_item",
+  "attack",
+  "defend"
+]

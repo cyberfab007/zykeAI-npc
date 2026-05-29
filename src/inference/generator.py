@@ -1,33 +1,36 @@
 import json
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-from src.models.adapter import load_model_with_adapter
 from src.mcp.client import call_tool
 from src.mcp.registry import allowed_tools
 
 
-ALLOWED_ACTIONS = [
-    "idle",
-    "nod",
-    "point",
-    "warn",
-    "give_item",
-    "take_item",
-    "attack",
-    "defend",
-]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-ALLOWED_EMOTIONS = [
-    "neutral",
-    "happy",
-    "angry",
-    "afraid",
-    "sad",
-    "curious",
-]
+
+def _load_schema_values(relative_path: str, fallback: List[str]) -> List[str]:
+    path = PROJECT_ROOT / relative_path
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return fallback
+    if isinstance(payload, list):
+        return [str(item) for item in payload if str(item)]
+    if isinstance(payload, dict) and isinstance(payload.get("values"), list):
+        return [str(item) for item in payload["values"] if str(item)]
+    return fallback
+
+
+ALLOWED_ACTIONS = _load_schema_values(
+    "data/schemas/npc_actions.json",
+    ["idle", "nod", "point", "warn", "give_item", "take_item", "attack", "defend"],
+)
+
+ALLOWED_EMOTIONS = _load_schema_values(
+    "data/schemas/npc_emotions.json",
+    ["neutral", "happy", "angry", "afraid", "sad", "curious"],
+)
 
 BAD_WORDS = [
     "kill yourself",
@@ -144,17 +147,24 @@ def _parse_tool_calls(raw_text: str) -> List[Dict[str, object]]:
 
 
 def generate_text(model_path, tokenizer_path, prompt, max_length=100):
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
     model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
 
     inputs = tokenizer.encode(prompt, return_tensors="pt")
     outputs = model.generate(inputs, max_length=max_length, num_return_sequences=1)
 
-    text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    text = _decode_generated_tokens(tokenizer, outputs[0], inputs.shape[-1])
     return text
 
 
-def _bad_words_ids(tokenizer: AutoTokenizer, words: List[str]) -> List[List[int]]:
+def _decode_generated_tokens(tokenizer: Any, output_tokens, prompt_length: int) -> str:
+    generated = output_tokens[prompt_length:]
+    return tokenizer.decode(generated, skip_special_tokens=True)
+
+
+def _bad_words_ids(tokenizer: Any, words: List[str]) -> List[List[int]]:
     ids = []
     for w in words:
         toks = tokenizer(w, add_special_tokens=False).input_ids
@@ -221,6 +231,10 @@ def generate_npc_response(
     mcp_timeout_sec: float = 5.0,
     max_tool_calls: int = 2,
 ) -> Dict[str, str]:
+    import torch
+
+    from src.models.adapter import load_model_with_adapter
+
     # Tool-augmented mode: allow the model to request tools, then re-ask for final JSON.
     tool_results = []
     tool_names = []
@@ -256,7 +270,7 @@ def generate_npc_response(
                 pad_token_id=tokenizer.eos_token_id,
                 bad_words_ids=bad_words_ids,
             )
-        raw = tokenizer.decode(output[0], skip_special_tokens=True)
+        raw = _decode_generated_tokens(tokenizer, output[0], inputs["input_ids"].shape[-1])
         calls = _parse_tool_calls(raw)[: max(0, int(max_tool_calls))]
         allowed = allowed_tools(manifest_path=tool_manifest_path, npc_type=npc_type, audience=audience)
         for call in calls:
@@ -288,7 +302,7 @@ def generate_npc_response(
                 pad_token_id=tokenizer.eos_token_id,
                 bad_words_ids=bad_words_ids,
             )
-        raw = tokenizer.decode(output[0], skip_special_tokens=True)
+        raw = _decode_generated_tokens(tokenizer, output[0], inputs["input_ids"].shape[-1])
         parsed = parse_npc_output(raw)
         return (parsed, {"final_outcome": "success", "npc_json_valid": True, "tool_results": tool_results}) if return_stats else parsed
 
@@ -322,7 +336,7 @@ def generate_npc_response(
                 pad_token_id=tokenizer.eos_token_id,
                 bad_words_ids=bad_words_ids,
             )
-        raw = tokenizer.decode(output[0], skip_special_tokens=True)
+        raw = _decode_generated_tokens(tokenizer, output[0], inputs["input_ids"].shape[-1])
         if not _enforce_safety(raw, safe_mode):
             stats["safety_filter_triggered"] = True
             stats["retry_reason"] = "safety_filter"

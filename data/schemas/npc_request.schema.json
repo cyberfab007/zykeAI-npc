@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ZykeAI NPC Generate Request",
+  "type": "object",
+  "required": ["persona", "context", "state", "player_input"],
+  "properties": {
+    "persona": { "type": "string", "minLength": 1 },
+    "context": { "type": "string", "minLength": 1 },
+    "state": { "type": "string", "minLength": 1 },
+    "player_input": { "type": "string", "minLength": 1 },
+    "npc_type": { "type": "string", "default": "generic" },
+    "audience": { "type": "string", "enum": ["minor", "adult"], "default": "minor" },
+    "base_model": { "type": "string" },
+    "tokenizer_path": { "type": "string" },
+    "adapter_name": { "type": "string" },
+    "adapter_version": { "type": ["string", "number", "integer"] },
+    "safe_mode": { "type": "boolean" },
+    "enforce_schema": { "type": "boolean" },
+    "max_new_tokens": { "type": "integer", "minimum": 1, "maximum": 2048 },
+    "temperature": { "type": "number", "minimum": 0, "maximum": 2 },
+    "top_p": { "type": "number", "minimum": 0, "maximum": 1 },
+    "top_k": { "type": "integer", "minimum": 0 },
+    "num_beams": { "type": "integer", "minimum": 1 }
+  },
+  "additionalProperties": true
+}

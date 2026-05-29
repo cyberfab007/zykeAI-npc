@@ -7,6 +7,7 @@ os.environ["REQUIRE_API_TOKEN"] = "false"
 os.environ["ALLOW_CUSTOM_ADAPTER_PATH"] = "true"  # allow stub path in tests
 
 from deployment.app import app  # noqa: E402
+import deployment.app as deployment_app  # noqa: E402
 
 
 @pytest.fixture
@@ -28,6 +29,28 @@ def test_health(client):
     resp = client.get("/health")
     assert resp.status_code == 200
     assert resp.get_json()["status"] == "ok"
+
+
+def test_worker_contract_endpoints(client):
+    status_resp = client.get("/status")
+    assert status_resp.status_code == 200
+    assert status_resp.get_json()["worker"]["bind_host"] == "127.0.0.1"
+
+    models_resp = client.get("/models")
+    assert models_resp.status_code == 200
+    assert "local_models" in models_resp.get_json()
+
+    adapters_resp = client.get("/adapters")
+    assert adapters_resp.status_code == 200
+    assert "npc_core_pythia_410m_v1" in adapters_resp.get_json()["adapters"]
+
+    training_resp = client.get("/training/status")
+    assert training_resp.status_code == 200
+    assert training_resp.get_json()["status"] == "idle"
+
+    memory_resp = client.get("/memory/status")
+    assert memory_resp.status_code == 200
+    assert "status" in memory_resp.get_json()
 
 
 def test_generate_single(client):
@@ -62,3 +85,22 @@ def test_generate_batch(client):
     assert resp.status_code == 200
     data = resp.get_json()
     assert "results" in data and len(data["results"]) == 2
+
+
+def test_generate_missing_field_validation(client):
+    payload = {"persona": "p", "context": "c", "state": "s"}
+    resp = client.post("/generate", data=json.dumps(payload), content_type="application/json")
+    assert resp.status_code == 500
+    assert "Missing fields: player_input" in resp.get_json()["error"]
+
+
+def test_concurrency_release_on_batch_error(client, monkeypatch):
+    def fake_handle(body):
+        raise ValueError("batch exploded")
+
+    monkeypatch.setattr(deployment_app, "_handle_single_request", fake_handle)
+    deployment_app.concurrency_count = 0
+    payload = {"requests": [{"persona": "p", "context": "c", "state": "s", "player_input": "hi"}]}
+    resp = client.post("/generate", data=json.dumps(payload), content_type="application/json")
+    assert resp.status_code == 500
+    assert deployment_app.concurrency_count == 0

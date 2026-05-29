@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import time
@@ -13,7 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.inference.generator import generate_npc_response
+generate_npc_response = None
 
 API_TOKEN = os.getenv("API_TOKEN")
 REQUIRE_API_TOKEN = os.getenv("REQUIRE_API_TOKEN", "true").lower() == "true"
@@ -59,6 +60,85 @@ def health():
     return jsonify({"status": "ok"}), 200
 
 
+@app.route("/status", methods=["GET"])
+def status():
+    return jsonify(
+        {
+            "status": "ok",
+            "worker": {
+                "bind_host": os.getenv("ZYKE_BIND_HOST", os.getenv("HOST", "127.0.0.1")),
+                "port": int(os.getenv("ZYKE_PORT", os.getenv("PORT", "5000"))),
+                "request_timeout_sec": REQUEST_TIMEOUT_SEC,
+                "rate_limit_requests": RATE_LIMIT_REQUESTS,
+                "rate_limit_window_sec": RATE_LIMIT_WINDOW_SEC,
+                "max_concurrency": MAX_CONCURRENCY,
+                "active_requests": concurrency_count,
+                "requires_api_token": REQUIRE_API_TOKEN,
+                "allow_custom_adapter_path": ALLOW_CUSTOM_ADAPTER_PATH,
+            },
+            "defaults": {
+                "base_model": DEFAULT_BASE_MODEL,
+                "tokenizer_path": DEFAULT_TOKENIZER_PATH,
+                "adapter_name": DEFAULT_ADAPTER_NAME,
+                "manifest_path": DEFAULT_MANIFEST_PATH,
+            },
+        }
+    ), 200
+
+
+@app.route("/models", methods=["GET"])
+@require_auth
+def models():
+    return jsonify(
+        {
+            "default_base_model": DEFAULT_BASE_MODEL,
+            "default_tokenizer_path": DEFAULT_TOKENIZER_PATH,
+            "local_models": _list_local_dirs(PROJECT_ROOT / "models"),
+        }
+    ), 200
+
+
+@app.route("/adapters", methods=["GET"])
+@require_auth
+def adapters():
+    manifest_path = request.args.get("manifest_path") or DEFAULT_MANIFEST_PATH
+    manifest = _load_json_file(PROJECT_ROOT / manifest_path, {})
+    return jsonify(
+        {
+            "default_adapter_name": DEFAULT_ADAPTER_NAME,
+            "manifest_path": manifest_path,
+            "adapters": manifest,
+            "local_adapters": _list_local_dirs(PROJECT_ROOT / "models" / "adapters"),
+        }
+    ), 200
+
+
+@app.route("/training/status", methods=["GET"])
+@require_auth
+def training_status():
+    return jsonify(
+        {
+            "status": "idle",
+            "supported": False,
+            "message": "Local training orchestration is not enabled in this worker build yet.",
+            "jobs": [],
+        }
+    ), 200
+
+
+@app.route("/memory/status", methods=["GET"])
+@require_auth
+def memory_status():
+    memory_dir = Path(os.getenv("ZYKE_MEMORY_DIR", PROJECT_ROOT / "memory"))
+    return jsonify(
+        {
+            "status": "available" if memory_dir.exists() else "not_configured",
+            "path": str(memory_dir),
+            "entries": len([p for p in memory_dir.iterdir() if p.is_file()]) if memory_dir.exists() else 0,
+        }
+    ), 200
+
+
 @app.route("/metrics", methods=["GET"])
 def get_metrics():
     if METRICS_REQUIRE_AUTH:
@@ -83,29 +163,29 @@ def generate():
         requests_counter.labels(endpoint=endpoint, status="concurrency_limited").inc()
         return jsonify({"error": "concurrency_limited"}), 429
 
-    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
 
-    # Support batching: payload may contain {"requests": [ ... ]} or a single request body.
-    requests_body = payload.get("requests")
-    if requests_body and isinstance(requests_body, list):
-        shared_flags = {
-            "quantization": payload.get("quantization"),
-            "use_flash_attn": payload.get("use_flash_attn", False),
-            "compile_model": payload.get("compile_model", False),
-            "audience": payload.get("audience"),
-            "base_model": payload.get("base_model"),
-            "tokenizer_path": payload.get("tokenizer_path"),
-            "adapter_path": payload.get("adapter_path"),
-            "safe_mode": payload.get("safe_mode"),
-            "enforce_schema": payload.get("enforce_schema"),
-            "max_new_tokens": payload.get("max_new_tokens"),
-            "temperature": payload.get("temperature"),
-            "top_p": payload.get("top_p"),
-            "top_k": payload.get("top_k"),
-            "num_beams": payload.get("num_beams"),
-        }
-        results = []
-        try:
+        # Support batching: payload may contain {"requests": [ ... ]} or a single request body.
+        requests_body = payload.get("requests")
+        if requests_body and isinstance(requests_body, list):
+            shared_flags = {
+                "quantization": payload.get("quantization"),
+                "use_flash_attn": payload.get("use_flash_attn", False),
+                "compile_model": payload.get("compile_model", False),
+                "audience": payload.get("audience"),
+                "base_model": payload.get("base_model"),
+                "tokenizer_path": payload.get("tokenizer_path"),
+                "adapter_path": payload.get("adapter_path"),
+                "safe_mode": payload.get("safe_mode"),
+                "enforce_schema": payload.get("enforce_schema"),
+                "max_new_tokens": payload.get("max_new_tokens"),
+                "temperature": payload.get("temperature"),
+                "top_p": payload.get("top_p"),
+                "top_k": payload.get("top_k"),
+                "num_beams": payload.get("num_beams"),
+            }
+            results = []
             for req in requests_body:
                 merged = dict(req)
                 # Batch-level flags override per-request flags to keep configs consistent within a batch.
@@ -114,50 +194,55 @@ def generate():
                         merged[k] = v
                 res = _handle_single_request(merged)
                 results.append(res)
-        except Exception as exc:
-            requests_counter.labels(endpoint=endpoint, status="error").inc()
-            return jsonify({"error": str(exc)}), 500
-
-        elapsed = time.time() - start_total
-        app.logger.info(
-            {
-                "event": "inference",
-                "batch_size": len(requests_body),
-                "latency_ms": elapsed * 1000,
-                "quantization": shared_flags.get("quantization"),
-                "use_flash_attn": shared_flags.get("use_flash_attn"),
-                "compile_model": shared_flags.get("compile_model"),
-            }
-        )
-        latency_hist.labels(endpoint=endpoint, status="success").observe(elapsed)
-        requests_counter.labels(endpoint=endpoint, status="success").inc()
-        _release_concurrency()
-        return jsonify({"results": results}), 200
-    else:
-        try:
+            elapsed = time.time() - start_total
+            app.logger.info(
+                {
+                    "event": "inference",
+                    "batch_size": len(requests_body),
+                    "latency_ms": elapsed * 1000,
+                    "quantization": shared_flags.get("quantization"),
+                    "use_flash_attn": shared_flags.get("use_flash_attn"),
+                    "compile_model": shared_flags.get("compile_model"),
+                }
+            )
+            latency_hist.labels(endpoint=endpoint, status="success").observe(elapsed)
+            requests_counter.labels(endpoint=endpoint, status="success").inc()
+            return jsonify({"results": results}), 200
+        else:
             result = _handle_single_request(payload)
-        except Exception as exc:
-            requests_counter.labels(endpoint=endpoint, status="error").inc()
-            _release_concurrency()
-            return jsonify({"error": str(exc)}), 500
-        elapsed = time.time() - start_total
-        app.logger.info(
-            {
-                "event": "inference",
-                "batch_size": 1,
-                "latency_ms": elapsed * 1000,
-                "quantization": payload.get("quantization"),
-                "use_flash_attn": payload.get("use_flash_attn", False),
-                "compile_model": payload.get("compile_model", False),
-            }
-        )
-        latency_hist.labels(endpoint=endpoint, status="success").observe(elapsed)
-        requests_counter.labels(endpoint=endpoint, status="success").inc()
+            elapsed = time.time() - start_total
+            app.logger.info(
+                {
+                    "event": "inference",
+                    "batch_size": 1,
+                    "latency_ms": elapsed * 1000,
+                    "quantization": payload.get("quantization"),
+                    "use_flash_attn": payload.get("use_flash_attn", False),
+                    "compile_model": payload.get("compile_model", False),
+                }
+            )
+            latency_hist.labels(endpoint=endpoint, status="success").observe(elapsed)
+            requests_counter.labels(endpoint=endpoint, status="success").inc()
+            return jsonify(result), 200
+    except Exception as exc:
+        requests_counter.labels(endpoint=endpoint, status="error").inc()
+        return jsonify({"error": str(exc)}), 500
+    finally:
         _release_concurrency()
-        return jsonify(result), 200
 
 
 def _handle_single_request(body: dict):
+    global generate_npc_response
+    if generate_npc_response is None:
+        try:
+            from src.inference.generator import generate_npc_response as loaded_generate_npc_response
+        except ImportError as exc:
+            raise RuntimeError(
+                "ZykeAI ML dependencies are not installed. Install requirements.txt "
+                "before calling /generate."
+            ) from exc
+        generate_npc_response = loaded_generate_npc_response
+
     required = ["persona", "context", "state", "player_input"]
     missing = [k for k in required if not body.get(k)]
     if missing:
@@ -262,5 +347,24 @@ def _release_concurrency() -> None:
         concurrency_count = max(0, concurrency_count - 1)
 
 
+def _load_json_file(path: Path, fallback):
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return fallback
+
+
+def _list_local_dirs(path: Path):
+    if not path.exists():
+        return []
+    return [
+        {"name": child.name, "path": str(child.relative_to(PROJECT_ROOT))}
+        for child in sorted(path.iterdir(), key=lambda item: item.name)
+        if child.is_dir()
+    ]
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    host = os.getenv("ZYKE_BIND_HOST", os.getenv("HOST", "127.0.0.1"))
+    port = int(os.getenv("ZYKE_PORT", os.getenv("PORT", "5000")))
+    app.run(host=host, port=port)

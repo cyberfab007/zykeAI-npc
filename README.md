@@ -8,9 +8,40 @@ Recommended baselines:
 
 ---
 
+## Local-First GameProfits Agent Architecture
+
+ZykeAI is designed to run NPC inference and training as a localhost worker under
+the GameProfits desktop agent. The central Zyke/Laravel services coordinate
+identity, registries, signed manifests, releases, jobs, and rewards, but normal
+per-NPC dialogue should stay on the user's machine.
+
+Default local worker behavior:
+
+- bind host: `127.0.0.1`
+- port: `5000`
+- auth: local bearer token from the desktop agent
+- API: `/health`, `/metrics`, `/generate`
+
+Runtime overrides:
+
+```bash
+ZYKE_BIND_HOST=127.0.0.1
+ZYKE_PORT=5000
+API_TOKEN=local-token
+REQUIRE_API_TOKEN=true
+python deployment/app.py
+```
+
+The GameProfits bridge contract lives in
+`gameprofits_bridge/local_protocol.md`, with a minimal client example in
+`gameprofits_bridge/example_agent_client.py`.
+
+---
+
 ## Table of Contents
 
 - [Project Structure](#project-structure)
+- [Local-First GameProfits Agent Architecture](#local-first-gameprofits-agent-architecture)
 - [Quickstart](#quickstart)
 - [Distributed Training Smoke Test (LoRA Delta Path)](#distributed-training-smoke-test-lora-delta-path)
 - [Deployment API](#deployment-api)
