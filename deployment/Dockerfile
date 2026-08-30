@@ -6,8 +6,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Copy root requirements to reuse full dependency set
-COPY requirements.txt /app/requirements.txt
+# Copy deployment requirements to keep the local API image lightweight
+COPY deployment/requirements.txt /app/requirements.txt
 RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir -r /app/requirements.txt
 
